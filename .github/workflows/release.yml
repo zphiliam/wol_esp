@@ -1,0 +1,88 @@
+name: Build & Release Firmware
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: esp32c3
+            fqbn: "esp32:esp32:esp32_family:PartitionScheme=min_spiffs"
+            core: "esp32:esp32"
+            core_url: "https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json"
+            artifact: "wol_esp32c3.bin"
+          - name: esp12f
+            fqbn: "esp8266:esp8266:nodemcuv2"
+            core: "esp8266:esp8266"
+            core_url: "https://arduino.esp8266.com/stable/package_esp8266com_index.json"
+            artifact: "wol_esp12f.bin"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Add board index
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls "${{ matrix.core_url }}"
+
+      - name: Install core
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install "${{ matrix.core }}"
+
+      - name: Install libraries
+        run: |
+          arduino-cli lib install "PubSubClient"
+          arduino-cli lib install "ArduinoJson"
+
+      - name: Build firmware
+        run: |
+          arduino-cli compile \
+            --fqbn "${{ matrix.fqbn }}" \
+            --output-dir build/ \
+            .
+
+      - name: Rename artifact
+        run: |
+          # arduino-cli 输出文件名因版本而异，找到 .bin 并重命名
+          BIN=$(find build/ -name "*.bin" ! -name "*bootloader*" ! -name "*partitions*" | head -1)
+          cp "$BIN" "${{ matrix.artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Release ${{ github.ref_name }}"
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            wol_esp32c3.bin
+            wol_esp12f.bin

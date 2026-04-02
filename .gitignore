@@ -1,0 +1,21 @@
+# Arduino build output
+build/
+*.elf
+*.bin
+*.map
+*.hex
+
+# Arduino IDE
+*.bak
+
+# config with credentials (keep config.h.example instead)
+# config.h  # uncomment if you want to exclude credentials from VCS
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+*.swp
+*~
