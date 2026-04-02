@@ -508,8 +508,13 @@ void enterSoftAPMode() {
 #endif
     bool apOk = WiFi.softAP(apSSID, nullptr, 6);  // 指定 ch6，避免信道扫描遗漏
 #ifndef ESP8266
-    if (cfg.wifi_tx_power > 0)
-        esp_wifi_set_max_tx_power((int8_t)(cfg.wifi_tx_power * 4));  // AP 模式同样需要限制功率（天线缺陷+LDO不足）
+    {
+        int8_t txp = cfg.wifi_tx_power;
+#ifdef CONFIG_IDF_TARGET_ESP32C3
+        if (txp == 0) txp = 15;  // ESP32-C3 天线缺陷+LDO不足，默认限制 15dBm
+#endif
+        if (txp > 0) esp_wifi_set_max_tx_power((int8_t)(txp * 4));
+    }
 #endif
     Serial.printf("[AP] softAP() = %s\n", apOk ? "OK" : "FAILED");
     Serial.printf("\n[AP] SoftAP started — SSID: %s  IP: 192.168.4.1\n", apSSID);
@@ -1022,10 +1027,16 @@ void startWiFi() {
     if (cfg.wifi_tx_power > 0)
         WiFi.setOutputPower((float)cfg.wifi_tx_power);   // ESP8266：0-20.5 dBm
 #else
-    if (cfg.wifi_tx_power > 0)
-        esp_wifi_set_max_tx_power((int8_t)(cfg.wifi_tx_power * 4));  // ESP32：单位 0.25dBm
+    {
+        int8_t txp = cfg.wifi_tx_power;
+#ifdef CONFIG_IDF_TARGET_ESP32C3
+        if (txp == 0) txp = 15;  // ESP32-C3 天线缺陷+LDO不足，默认限制 15dBm
 #endif
-    Serial.printf("[WiFi] TX power = %ddBm\n", cfg.wifi_tx_power);
+        if (txp > 0) esp_wifi_set_max_tx_power((int8_t)(txp * 4));
+    }
+#endif
+    Serial.printf("[WiFi] TX power = %ddBm%s\n", cfg.wifi_tx_power,
+        (cfg.wifi_tx_power == 0) ? " (platform default)" : "");
 
     // 首次连接（或重新配置后）先主动扫描，快速检测 SSID 是否存在，避免等待整个超时周期。
     // 仅在 !wifi_ever_ok 时执行：wifi_ever_ok=true 说明曾经连上过，SSID 找不到可能是路由器

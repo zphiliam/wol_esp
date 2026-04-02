@@ -70,7 +70,7 @@ https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32
 | 参数 | 值 | 说明 |
 |------|----|------|
 | USB CDC On Boot | **Enabled** | 必须开启，否则串口无输出 |
-| Partition Scheme | **No OTA (2MB APP/2MB SPIFFS)** | 固件含 TLS 较大，默认 1.2MB APP 不够用 |
+| Partition Scheme | **Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)** | 支持 OTA；每个 APP 分区 ~1.9MB 可容纳含 TLS 的固件 |
 | Upload Speed | 921600 | |
 | Flash Size | 4MB (32Mb) | |
 
@@ -131,7 +131,7 @@ save
 在 MQTT 客户端订阅 `home/wol/<mqtt_id>/event`，收到如下消息即表示上线成功：
 
 ```json
-{"event":"online","version":"2.2.1-20260331","uptime":3,"heap":44000,"ip":"192.168.1.x"}
+{"event":"online","version":"2.3.2-20260402","uptime":3,"heap":44000,"ip":"192.168.1.x"}
 ```
 
 ---
@@ -166,6 +166,20 @@ save
 {"cmd":"wol","mac":"AABBCCDDEEFF"}                   // 唤醒指定 MAC 的电脑
 {"cmd":"ping"}                                       // 测试连通性
 {"cmd":"info"}                                       // 查询设备信息
-{"cmd":"set","key":"status_interval","val":60}       // 设置心跳间隔（秒）
+{"cmd":"set","key":"status_interval","val":60}       // 设置心跳间隔（秒），0 为禁用
 {"cmd":"reboot"}                                     // 重启设备
+{"cmd":"ota","url":"https://.../firmware.bin"}       // OTA 空中升级
 ```
+
+## OTA 升级
+
+向 `home/wol/<mqtt_id>/cmd` 发送：
+
+```json
+{"cmd":"ota","url":"https://github.com/user/repo/releases/download/v2.3.1/firmware.bin"}
+```
+
+- 自动跟踪 HTTP 重定向（支持 GitHub release URL）
+- 升级期间 MQTT 断开，进度输出到串口
+- 成功后设备自动重启，并发布 `ota_success` 事件；失败发布 `ota_fail`
+- **ESP32-C3 须使用 Minimal SPIFFS 分区方案**（见上方环境搭建）才能支持 OTA

@@ -54,7 +54,7 @@ jobs:
       - name: Rename artifact
         run: |
           # arduino-cli 输出文件名因版本而异，找到 .bin 并重命名
-          BIN=$(find build/ -name "*.bin" ! -name "*bootloader*" ! -name "*partitions*" | head -1)
+          BIN=$(find build/ -name "*.bin" ! -name "*bootloader*" ! -name "*partitions*" ! -name "*merged*" | head -1)
           cp "$BIN" "${{ matrix.artifact }}"
 
       - name: Upload artifact
