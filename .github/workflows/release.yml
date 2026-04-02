@@ -12,7 +12,7 @@ jobs:
       matrix:
         include:
           - name: esp32c3
-            fqbn: "esp32:esp32:esp32_family:PartitionScheme=min_spiffs"
+            fqbn: "esp32:esp32:esp32c3:CDCOnBoot=cdc,CPUFreq=160,FlashMode=qio,FlashSize=4M,PartitionScheme=min_spiffs"
             core: "esp32:esp32"
             core_url: "https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json"
             artifact: "wol_esp32c3.bin"
