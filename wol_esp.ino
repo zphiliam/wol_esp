@@ -822,6 +822,7 @@ void doOTA(const char* urlParam) {
                             Serial.printf("[OTA] %u%%\n", (unsigned)(done * 100 / total));
                     });
                     WiFiClient* stream = http.getStreamPtr();
+                    stream->setTimeout(10000);  // 每次 chunk 读取最长等 10s
                     size_t written = Update.writeStream(*stream);
                     Serial.printf("[OTA] written %u bytes\n", (unsigned)written);
                     if (Update.end(true) && Update.isFinished()) {
@@ -848,8 +849,6 @@ void doOTA(const char* urlParam) {
             "{\"event\":\"ota_success\",\"uptime\":%lu,\"heap\":%u}",
             millis() / 1000, ESP.getFreeHeap());
         mqtt.publish(TOPIC_PUB, buf);
-        delay(500);
-        ESP.restart();
     } else {
         char buf[256];
         snprintf(buf, sizeof(buf),
@@ -857,6 +856,8 @@ void doOTA(const char* urlParam) {
             failReason.c_str(), millis() / 1000, ESP.getFreeHeap());
         mqtt.publish(TOPIC_PUB, buf);
     }
+    delay(500);
+    ESP.restart();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
