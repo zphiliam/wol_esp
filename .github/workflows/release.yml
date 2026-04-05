@@ -102,6 +102,10 @@ jobs:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           GITEE_REPO: ${{ secrets.GITEE_REPO }}
         run: |
+          if [ -z "${GITEE_TOKEN}" ] || [ -z "${GITEE_REPO}" ]; then
+            echo "GITEE_TOKEN or GITEE_REPO secret not configured, skipping Gitee sync."
+            exit 0
+          fi
           # 触发 Gitee 从 GitHub 同步（镜像仓库不可直接 push）
           curl -sf -X POST "https://gitee.com/api/v5/repos/${GITEE_REPO}/sync" \
             -d "access_token=${GITEE_TOKEN}"
@@ -123,6 +127,10 @@ jobs:
           GITEE_REPO: ${{ secrets.GITEE_REPO }}
           TAG: ${{ github.ref_name }}
         run: |
+          if [ -z "${GITEE_TOKEN}" ] || [ -z "${GITEE_REPO}" ]; then
+            echo "GITEE_TOKEN or GITEE_REPO secret not configured, skipping Gitee release."
+            exit 0
+          fi
           # 创建 release
           RESPONSE=$(curl -sf -X POST "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases" \
             -H "Content-Type: application/json" \
