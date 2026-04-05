@@ -25,6 +25,7 @@
  *   {"cmd":"ping"}                             测试连通性
  *   {"cmd":"reboot"}                           重启设备
  *   {"cmd":"info"}                             查询设备信息
+ *   {"cmd":"show"}                             查询完整状态（配置+运行时信息）
  *   {"cmd":"config"}                           查询所有配置
  *   {"cmd":"led","val":"on|off|toggle|query"}  控制 LED
  *   {"cmd":"led","val":"blink","times":5,"interval":500}
@@ -250,8 +251,8 @@ void enterConfigMode() {
 
             } else if (line == "show") {
                 Serial.println(F("[CFG] staged config:"));
-                Serial.printf("  wifi_ssid  : %s\n",  staged.wifi_ssid);
-                Serial.printf("  wifi_pass  : %s\n",  strlen(staged.wifi_pass) ? staged.wifi_pass : "(not set)");
+                Serial.printf("  wifi_ssid  : %s  (len=%u)\n", staged.wifi_ssid, strlen(staged.wifi_ssid));
+                Serial.printf("  wifi_pass  : %s  (len=%u)\n", strlen(staged.wifi_pass) ? staged.wifi_pass : "(not set)", strlen(staged.wifi_pass));
                 Serial.printf("  mqtt_server: %s\n",  staged.mqtt_server);
                 Serial.printf("  mqtt_port  : %u\n",  staged.mqtt_port);
                 Serial.printf("  mqtt_user  : %s\n",  staged.mqtt_user);
@@ -566,6 +567,7 @@ void checkSoftAPFlag() {
 //   串口输入 "config"  → 写 /reconfig，重启进入串口 CLI
 //   串口输入 "ap"      → 写 /softap，重启进入 SoftAP 模式
 //   串口输入 "reboot"  → 直接重启
+//   串口输入 "show"    → 打印当前运行状态（不重启）
 //   按键按住 3s 松手   → 写 /softap，重启进入 SoftAP 模式（LED 双闪提示）
 //   按键按住 10s      → 写 /reconfig，重启进入串口 CLI（配置保留，LED 五闪确认）
 // ─────────────────────────────────────────────────────────────────────────────
@@ -597,6 +599,20 @@ void checkRuntimeTriggers() {
                 Serial.println(F("[CFG] serial trigger → rebooting..."));
                 delay(100);
                 ESP.restart();
+            } else if (serialLineBuf == "show") {
+                Serial.println(F("------- 当前状态 ---------------"));
+                Serial.printf("  固件版本   : %s\n",  FW_VERSION);
+                Serial.printf("  SSID       : %s\n",  cfg.wifi_ssid);
+                Serial.printf("  IP         : %s\n",  WiFi.localIP().toString().c_str());
+                Serial.printf("  RSSI       : %ddBm\n", WiFi.RSSI());
+                Serial.printf("  MQTT 服务器: %s:%u\n", cfg.mqtt_server, cfg.mqtt_port);
+                Serial.printf("  Client ID  : %s\n",  cfg.mqtt_id);
+                Serial.printf("  WoL MAC    : %s\n",  cfg.wol_mac);
+                Serial.printf("  上报间隔   : %lus\n", statusIntervalMs / 1000);
+                Serial.printf("  重连次数   : %u\n",   mqttReconnectCount);
+                Serial.printf("  运行时长   : %lus\n", millis() / 1000);
+                Serial.printf("  可用堆     : %u bytes\n", ESP.getFreeHeap());
+                Serial.println(F("--------------------------------"));
             }
             serialLineBuf = "";
         } else {
@@ -917,6 +933,26 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
         resp["reconnects"] = mqttReconnectCount;
         pubJson(resp);
 
+    // ── show ──
+    } else if (strcmp(cmd, "show") == 0) {
+        StaticJsonDocument<512> resp;
+        resp["event"]           = "show";
+        resp["version"]         = FW_VERSION;
+        resp["wifi_ssid"]       = cfg.wifi_ssid;
+        resp["wol_mac"]         = cfg.wol_mac;
+        resp["mqtt_server"]     = cfg.mqtt_server;
+        resp["mqtt_port"]       = cfg.mqtt_port;
+        resp["mqtt_user"]       = cfg.mqtt_user;
+        resp["mqtt_id"]         = cfg.mqtt_id;
+        resp["status_interval"] = statusIntervalMs / 1000;
+        resp["wifi_tx_power"]   = cfg.wifi_tx_power;
+        resp["ip"]              = WiFi.localIP().toString();
+        resp["rssi"]            = WiFi.RSSI();
+        resp["uptime"]          = millis() / 1000;
+        resp["heap"]            = ESP.getFreeHeap();
+        resp["reconnects"]      = mqttReconnectCount;
+        pubJson(resp);
+
     // ── config ──
     } else if (strcmp(cmd, "config") == 0) {
         StaticJsonDocument<384> resp;
@@ -1082,11 +1118,11 @@ void waitWiFiConnected() {
         } else {
             Serial.print('.');
         }
-        // WL_WRONG_PASSWORD(7, ESP8266) / WL_CONNECT_FAILED(4) / WL_NO_SSID_AVAIL(1) 是明确的
-        // 失败状态，仅在首次连接时才快速进配置模式；曾经连上过的情况下这些状态可能是暂时的
-        // （路由器重启、信号抖动），交给超时逻辑决定走重启还是配置模式
-        if (!cfg.wifi_ever_ok && (s == WL_CONNECT_FAILED || s == WL_NO_SSID_AVAIL || s == 7)) {
-            Serial.printf("\n[WiFi] connect failed (%s) → config mode\n", wifiStatusName(s));
+        // WL_NO_SSID_AVAIL(1) 是首次连接时唯一可信的快速失败信号（SSID 根本不存在）。
+        // WL_WRONG_PASSWORD(7) 在 ESP8266 上是 WPA2 握手过程中的过渡状态，不能作为快速失败依据；
+        // WL_CONNECT_FAILED(4) 同理，可能是暂时的。两者均交给超时逻辑处理。
+        if (!cfg.wifi_ever_ok && s == WL_NO_SSID_AVAIL) {
+            Serial.printf("\n[WiFi] SSID not found → config mode\n");
             enterConfigMode();  // 永不返回
         }
         checkRuntimeTriggers();
@@ -1212,8 +1248,8 @@ void setup() {
     Serial.println(F("------- 当前配置 ---------------"));
     Serial.printf("  固件版本   : %s\n",  FW_VERSION);
     Serial.println(F("  [WiFi]"));
-    Serial.printf("    SSID     : %s\n",  cfg.wifi_ssid);
-    Serial.printf("    密码     : %s\n",  cfg.wifi_pass);
+    Serial.printf("    SSID     : %s  (len=%u)\n", cfg.wifi_ssid, strlen(cfg.wifi_ssid));
+    Serial.printf("    密码     : %s  (len=%u)\n", cfg.wifi_pass, strlen(cfg.wifi_pass));
     Serial.println(F("  [MQTT]"));
     Serial.printf("    服务器   : %s:%u\n", cfg.mqtt_server, cfg.mqtt_port);
     Serial.printf("    用户名   : %s\n",  cfg.mqtt_user);
