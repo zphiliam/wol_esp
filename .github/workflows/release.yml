@@ -90,6 +90,7 @@ jobs:
   release-gitee:
     needs: build
     runs-on: ubuntu-latest
+    environment: GITEE_TOKEN
 
     steps:
       - name: Download all artifacts
