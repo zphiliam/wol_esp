@@ -86,3 +86,50 @@ jobs:
           files: |
             wol_esp32c3.bin
             wol_esp12f.bin
+
+  release-gitee:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 完整历史，确保 tag 可推送
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Push tag to Gitee
+        run: |
+          git push "https://${{ secrets.GITEE_TOKEN }}@gitee.com/${{ secrets.GITEE_REPO }}.git" \
+            "refs/tags/${{ github.ref_name }}:refs/tags/${{ github.ref_name }}" \
+            --force
+
+      - name: Create Gitee Release and upload assets
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_REPO: ${{ secrets.GITEE_REPO }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # 创建 release
+          RESPONSE=$(curl -sf -X POST "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"access_token\": \"${GITEE_TOKEN}\",
+              \"tag_name\": \"${TAG}\",
+              \"name\": \"Release ${TAG}\",
+              \"body\": \"Release ${TAG}\"
+            }")
+          RELEASE_ID=$(echo "$RESPONSE" | jq -r '.id')
+          echo "Gitee release id: $RELEASE_ID"
+
+          # 上传固件文件
+          for FILE in wol_esp32c3.bin wol_esp12f.bin; do
+            echo "Uploading $FILE ..."
+            curl -sf -X POST "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
+              -F "access_token=${GITEE_TOKEN}" \
+              -F "file=@${FILE}"
+          done

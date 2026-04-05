@@ -47,7 +47,7 @@
 
 // ── OTA ──────────────────────────────────────────────────────────────────────
 #ifdef ESP8266
-  #include <ESP8266httpUpdate.h>
+  #include <ESP8266HTTPClient.h>
 #else
   #include <HTTPClient.h>
   #include <Update.h>
@@ -767,8 +767,8 @@ void blinkTick() {
 // doOTA：从指定 URL 下载固件并执行 OTA 升级
 //   流程：发布 ota_start → 断开 MQTT（释放 TLS 内存）→ 下载写入 → 重连 MQTT →
 //         发布 ota_success（后立即重启）或 ota_fail（恢复正常运行）
-//   重定向：ESP8266 由 ESPhttpUpdate 自动跟踪；ESP32-C3 由 HTTPClient 跟踪
-//   TLS：setInsecure()，与主连接一致，不验证证书
+//   重定向：手动逐跳跟踪（每跳独立新 WiFiClient/WiFiClientSecure），支持跨主机
+//   HTTP/HTTPS：根据每跳 URL scheme 自动选择客户端类型，TLS 不验证证书
 // ─────────────────────────────────────────────────────────────────────────────
 void doOTA(const char* urlParam) {
     // 立即复制 URL，避免后续操作污染调用方的栈帧或 MQTT 缓冲区
@@ -794,66 +794,92 @@ void doOTA(const char* urlParam) {
     bool   success = false;
     String failReason;
 
-#ifdef ESP8266
-    // ── ESP8266：使用 ESPhttpUpdate，自动跟踪重定向 ──
+    // ── HTTPClient + Update，手动逐跳跟踪重定向，每跳独立新客户端 ──────────────
+    // 不使用 ESPhttpUpdate / setFollowRedirects：
+    //   - ESPhttpUpdate 发送 x-ESP8266-* 请求头，部分代理服务会据此屏蔽
+    //   - HTTPC_FORCE_FOLLOW_REDIRECTS 在跨主机跳转时复用同一 TLS 对象，导致握手失败
+    // 统一实现：每跳新建 WiFiClient/WiFiClientSecure，确保 TLS 连接独立
     {
-        WiFiClientSecure otaClient;
-        otaClient.setInsecure();
-        ESPhttpUpdate.rebootOnUpdate(false);
-        ESPhttpUpdate.onProgress([](int cur, int total) {
-            if (total > 0)
-                Serial.printf("[OTA] %d%% (%d/%d)\n", cur * 100 / total, cur, total);
-        });
-        t_httpUpdate_return ret = ESPhttpUpdate.update(otaClient, url);
-        if (ret == HTTP_UPDATE_OK) {
-            success = true;
-        } else {
-            failReason = ESPhttpUpdate.getLastErrorString();
-            Serial.printf("[OTA] failed: %s\n", failReason.c_str());
-        }
-    }
-#else
-    // ── ESP32-C3：使用 HTTPClient + Update，setFollowRedirects 跟踪重定向 ──
-    {
-        WiFiClientSecure otaClient;
-        otaClient.setInsecure();
+        String currentUrl = String(url);
+        for (int hop = 0; hop < 5; hop++) {
+            bool hopHttps = currentUrl.startsWith("https://");
 
-        HTTPClient http;
-        http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-        http.setTimeout(30000);
+            // 两种客户端均在循环体内声明，生命周期覆盖本次跳转（含流式写入）
+            WiFiClientSecure sc;
+            WiFiClient       c;
 
-        if (!http.begin(otaClient, url)) {
-            failReason = F("http.begin failed");
-        } else {
+            HTTPClient http;
+            http.setTimeout(30000);
+            http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+
+            bool began;
+            if (hopHttps) {
+                sc.setInsecure();
+                began = http.begin(sc, currentUrl);
+            } else {
+                began = http.begin(c, currentUrl);
+            }
+            if (!began) {
+                failReason = F("http.begin failed");
+                break;
+            }
+
             int code = http.GET();
-            Serial.printf("[OTA] HTTP %d\n", code);
+            Serial.printf("[OTA] hop %d HTTP %d\n", hop, code);
+
+            if ((code / 100) == 3) {
+                String loc = http.getLocation();
+                http.end();
+                if (loc.length() > 0) {
+                    Serial.printf("[OTA] → %s\n", loc.c_str());
+                    currentUrl = loc;
+                    continue;
+                }
+                failReason = F("redirect: no Location header");
+                break;
+            }
+
             if (code == HTTP_CODE_OK) {
                 int totalSize = http.getSize();
                 Serial.printf("[OTA] size: %d bytes\n", totalSize);
-                if (!Update.begin(totalSize > 0 ? totalSize : UPDATE_SIZE_UNKNOWN)) {
-                    failReason = Update.errorString();
+#ifdef ESP8266
+                size_t updateSize = totalSize > 0 ? (size_t)totalSize : (size_t)-1;
+                #define OTA_ERROR_STRING Update.getErrorString()
+#else
+                int updateSize = totalSize > 0 ? totalSize : UPDATE_SIZE_UNKNOWN;
+                #define OTA_ERROR_STRING Update.errorString()
+#endif
+                if (!Update.begin(updateSize)) {
+                    failReason = OTA_ERROR_STRING;
+                    Serial.printf("[OTA] Update.begin failed: %s\n", failReason.c_str());
                 } else {
                     Update.onProgress([](size_t done, size_t total) {
                         if (total > 0 && done % (total / 10 + 1) == 0)
                             Serial.printf("[OTA] %u%%\n", (unsigned)(done * 100 / total));
                     });
                     WiFiClient* stream = http.getStreamPtr();
-                    stream->setTimeout(10000);  // 每次 chunk 读取最长等 10s
+                    stream->setTimeout(30000);
                     size_t written = Update.writeStream(*stream);
                     Serial.printf("[OTA] written %u bytes\n", (unsigned)written);
                     if (Update.end(true) && Update.isFinished()) {
                         success = true;
                     } else {
-                        failReason = Update.errorString();
+                        failReason = OTA_ERROR_STRING;
+                        Serial.printf("[OTA] Update.end failed: %s\n", failReason.c_str());
                     }
                 }
+                #undef OTA_ERROR_STRING
+            } else if (code < 0) {
+                failReason = String(F("HTTP error: ")) + HTTPClient::errorToString(code);
+                Serial.printf("[OTA] connection error: %s\n", failReason.c_str());
             } else {
                 failReason = String(F("HTTP ")) + code;
+                Serial.printf("[OTA] unexpected response: %d\n", code);
             }
             http.end();
+            break;
         }
     }
-#endif
 
     // 3. 重连 MQTT，发布结果
     Serial.printf("[OTA] result: %s\n", success ? "success" : failReason.c_str());

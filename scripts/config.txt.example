@@ -1,6 +1,7 @@
+# comment
 set wifi_ssid WIFI_NAME
 set wifi_pass password
-set mqtt_server example..emqxsl.com
+set mqtt_server example.emqxsl.com
 set mqtt_port 8883
 set mqtt_user esp8266
 set mqtt_pass xxxxx
