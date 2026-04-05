@@ -799,6 +799,7 @@ void doOTA(const char* urlParam) {
     {
         WiFiClientSecure otaClient;
         otaClient.setInsecure();
+        otaClient.setBufferSizes(512, 512);  // 减少 BearSSL 缓冲区，节省约 18KB heap
         ESPhttpUpdate.rebootOnUpdate(false);
         ESPhttpUpdate.onProgress([](int cur, int total) {
             if (total > 0)
