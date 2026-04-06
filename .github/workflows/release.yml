@@ -128,7 +128,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           # 创建 release
-          RESPONSE=$(curl -sf -X POST "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases" \
+          RESPONSE=$(curl -s -X POST "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases" \
             -H "Content-Type: application/json" \
             -d "{
               \"access_token\": \"${GITEE_TOKEN}\",
@@ -136,13 +136,19 @@ jobs:
               \"name\": \"Release ${TAG}\",
               \"body\": \"Release ${TAG}\"
             }")
+          echo "Create release response: ${RESPONSE}"
           RELEASE_ID=$(echo "$RESPONSE" | jq -r '.id')
+          if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" = "null" ]; then
+            echo "Failed to create Gitee release"
+            exit 1
+          fi
           echo "Gitee release id: $RELEASE_ID"
 
           # 上传固件文件
           for FILE in wol_esp32c3.bin wol_esp12f.bin; do
             echo "Uploading $FILE ..."
-            curl -sf -X POST "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
+            UPLOAD_RESP=$(curl -s -X POST "https://gitee.com/api/v5/repos/${GITEE_REPO}/releases/${RELEASE_ID}/attach_files" \
               -F "access_token=${GITEE_TOKEN}" \
-              -F "file=@${FILE}"
+              -F "file=@${FILE}")
+            echo "Upload response: ${UPLOAD_RESP}"
           done
