@@ -92,34 +92,26 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           merge-multiple: true
 
-      - name: Sync Gitee mirror from GitHub
+      - name: Push code and tag to Gitee
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           GITEE_REPO: ${{ secrets.GITEE_REPO }}
         run: |
-          # 触发 Gitee 从 GitHub 同步（-f 去掉，失败时打印响应而非直接退出）
-          SYNC_RESP=$(curl -s -X POST "https://gitee.com/api/v5/repos/${GITEE_REPO}/sync" \
-            -d "access_token=${GITEE_TOKEN}")
-          echo "Sync response: ${SYNC_RESP}"
-          # 轮询 tag 是否出现（最长等 2 分钟）
-          for i in $(seq 1 12); do
-            sleep 10
-            STATUS=$(curl -s "https://gitee.com/api/v5/repos/${GITEE_REPO}/tags?access_token=${GITEE_TOKEN}" \
-              | jq -r '.[].name' | grep -x "${{ github.ref_name }}" || true)
-            if [ -n "$STATUS" ]; then
-              echo "Tag ${{ github.ref_name }} synced."
-              break
-            fi
-            echo "Waiting for sync... ($i/12)"
-            if [ "$i" -eq 12 ]; then
-              echo "Timeout waiting for tag, proceeding anyway."
-            fi
-          done
+          GITEE_OWNER=$(echo "${GITEE_REPO}" | cut -d'/' -f1)
+          REMOTE="https://${GITEE_OWNER}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git"
+          git remote add gitee "$REMOTE"
+          git push gitee HEAD:main --force
+          git push gitee "refs/tags/${{ github.ref_name }}" --force
 
       - name: Create Gitee Release and upload assets
         env:
