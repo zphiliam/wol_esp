@@ -126,7 +126,8 @@ jobs:
               \"access_token\": \"${GITEE_TOKEN}\",
               \"tag_name\": \"${TAG}\",
               \"name\": \"Release ${TAG}\",
-              \"body\": \"Release ${TAG}\"
+              \"body\": \"Release ${TAG}\",
+              \"target_commitish\": \"main\"
             }")
           echo "Create release response: ${RESPONSE}"
           RELEASE_ID=$(echo "$RESPONSE" | jq -r '.id')
