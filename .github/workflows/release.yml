@@ -24,10 +24,21 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup arduino-cli
         uses: arduino/setup-arduino-cli@v2
+
+      - name: Cache Arduino data
+        id: cache-arduino
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.arduino15
+            ~/Arduino/libraries
+          key: arduino-${{ matrix.core }}-${{ hashFiles('.github/workflows/release.yml') }}
+          restore-keys: |
+            arduino-${{ matrix.core }}-
 
       - name: Add board index
         run: |
@@ -35,11 +46,13 @@ jobs:
           arduino-cli config add board_manager.additional_urls "${{ matrix.core_url }}"
 
       - name: Install core
+        if: steps.cache-arduino.outputs.cache-hit != 'true'
         run: |
           arduino-cli core update-index
           arduino-cli core install "${{ matrix.core }}"
 
       - name: Install libraries
+        if: steps.cache-arduino.outputs.cache-hit != 'true'
         run: |
           arduino-cli lib install "PubSubClient"
           arduino-cli lib install "ArduinoJson"
@@ -58,7 +71,7 @@ jobs:
           cp "$BIN" "${{ matrix.artifact }}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
@@ -71,7 +84,7 @@ jobs:
 
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4  # TODO: 确认是否有支持 Node 24 的新版本
         with:
           merge-multiple: true
 
@@ -92,26 +105,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4  # TODO: 确认是否有支持 Node 24 的新版本
         with:
           merge-multiple: true
-
-      - name: Push code and tag to Gitee
-        env:
-          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          GITEE_REPO: ${{ secrets.GITEE_REPO }}
-        run: |
-          GITEE_OWNER=$(echo "${GITEE_REPO}" | cut -d'/' -f1)
-          REMOTE="https://${GITEE_OWNER}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git"
-          git remote add gitee "$REMOTE"
-          git push gitee HEAD:main --force
-          git push gitee "refs/tags/${{ github.ref_name }}" --force
 
       - name: Create Gitee Release and upload assets
         env:
