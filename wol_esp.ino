@@ -903,6 +903,90 @@ void doOTA(const char* urlParam) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// doSetMqtt：在线更新 MQTT 连接配置
+//   流程：断开当前 MQTT → 临时客户端测试新连接 → 成功则保存并切换，失败则恢复原连接
+//   注意：测试客户端与主客户端顺序使用，避免双 TLS 上下文同时占用内存（ESP8266 关键）
+// ─────────────────────────────────────────────────────────────────────────────
+void doSetMqtt(const char* newServer, uint16_t newPort,
+               const char* newUser,   const char* newPass, const char* newId) {
+    // 1. 用当前配置作基础，仅覆盖非空字段
+    char   testServer[64];  strlcpy(testServer, strlen(newServer) > 0 ? newServer : cfg.mqtt_server, sizeof(testServer));
+    uint16_t testPort =     newPort > 0       ? newPort   : cfg.mqtt_port;
+    char   testUser[64];    strlcpy(testUser,   strlen(newUser)   > 0 ? newUser   : cfg.mqtt_user,   sizeof(testUser));
+    char   testPass[64];    strlcpy(testPass,   strlen(newPass)   > 0 ? newPass   : cfg.mqtt_pass,   sizeof(testPass));
+    char   testId[32];      strlcpy(testId,     strlen(newId)     > 0 ? newId     : cfg.mqtt_id,     sizeof(testId));
+
+    Serial.printf("[SET_MQTT] testing → %s:%u  user=%s  id=%s\n",
+        testServer, testPort, testUser, testId);
+
+    // 2. 断开当前 MQTT（释放 TLS 资源），并保存原配置副本用于失败回退
+    char   origServer[64];  strlcpy(origServer, cfg.mqtt_server, sizeof(origServer));
+    uint16_t origPort  = cfg.mqtt_port;
+    char   origUser[64];    strlcpy(origUser,   cfg.mqtt_user,   sizeof(origUser));
+    char   origPass[64];    strlcpy(origPass,   cfg.mqtt_pass,   sizeof(origPass));
+    char   origId[32];      strlcpy(origId,     cfg.mqtt_id,     sizeof(origId));
+
+    mqtt.disconnect();
+    delay(100);
+
+    // 3. 用独立临时客户端（独立 TLS 上下文）测试连接
+    bool ok = false;
+    int  testRc = 0;
+    {
+        WiFiClientSecure testWifiClient;
+        testWifiClient.setInsecure();
+        PubSubClient testMqtt(testWifiClient);
+        testMqtt.setServer(testServer, testPort);
+        testMqtt.setSocketTimeout(10);  // 单次 TCP 超时 10s，避免长时间阻塞
+
+        Serial.println(F("[SET_MQTT] connecting test client..."));
+        ok = testMqtt.connect(testId, testUser, testPass);
+        testRc = testMqtt.state();
+        if (ok) {
+            testMqtt.disconnect();
+            Serial.println(F("[SET_MQTT] test OK"));
+        } else {
+            Serial.printf("[SET_MQTT] test FAILED rc=%d\n", testRc);
+        }
+        // testWifiClient 析构，TLS 资源释放
+    }
+
+    if (ok) {
+        // 4a. 写入新配置并持久化
+        strlcpy(cfg.mqtt_server, testServer, sizeof(cfg.mqtt_server));
+        cfg.mqtt_port = testPort;
+        strlcpy(cfg.mqtt_user, testUser, sizeof(cfg.mqtt_user));
+        strlcpy(cfg.mqtt_pass, testPass, sizeof(cfg.mqtt_pass));
+        strlcpy(cfg.mqtt_id,   testId,   sizeof(cfg.mqtt_id));
+
+        // 更新订阅/发布主题（mqtt_id 可能已变）
+        snprintf(TOPIC_SUB, sizeof(TOPIC_SUB), "home/wol/%s/cmd",   cfg.mqtt_id);
+        snprintf(TOPIC_PUB, sizeof(TOPIC_PUB), "home/wol/%s/event", cfg.mqtt_id);
+
+        saveConfig();
+        Serial.println(F("[SET_MQTT] config saved, reconnecting to new broker"));
+
+        mqtt.setServer(cfg.mqtt_server, cfg.mqtt_port);
+        connectMQTT();
+        pubEvent("ok:mqtt_updated");
+
+    } else {
+        // 4b. 恢复原配置，重连原 broker
+        Serial.println(F("[SET_MQTT] reverting to original broker"));
+        mqtt.setServer(origServer, origPort);
+
+        // cfg 未变，connectMQTT 会用 cfg 里的凭据
+        connectMQTT();
+
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "{\"event\":\"error:mqtt_connect_failed\",\"rc\":%d,\"uptime\":%lu,\"heap\":%u}",
+            testRc, millis() / 1000, ESP.getFreeHeap());
+        mqtt.publish(TOPIC_PUB, buf);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // mqttCallback：处理下行指令
 // ─────────────────────────────────────────────────────────────────────────────
 void mqttCallback(char* topic, byte* payload, unsigned int len) {
@@ -1045,6 +1129,26 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
             pubEvent("led:blink");
         } else {
             pubEvent("error:unknown_led_val");
+        }
+
+    // ── set_mqtt ──
+    } else if (strcmp(cmd, "set_mqtt") == 0) {
+        const char* newServer = doc["server"] | "";
+        uint16_t    newPort   = doc["port"]   | 0;
+        const char* newUser   = doc["user"]   | "";
+        const char* newPass   = doc["pass"]   | "";
+        const char* newId     = doc["id"]     | "";
+
+        // 至少要有一个字段发生实质性变化
+        bool anyChange = (strlen(newServer) > 0 && strcmp(newServer, cfg.mqtt_server) != 0)
+                      || (newPort > 0            && newPort != cfg.mqtt_port)
+                      || (strlen(newUser) > 0    && strcmp(newUser, cfg.mqtt_user) != 0)
+                      || (strlen(newPass) > 0    && strcmp(newPass, cfg.mqtt_pass) != 0)
+                      || (strlen(newId)   > 0    && strcmp(newId,   cfg.mqtt_id)   != 0);
+        if (!anyChange) {
+            pubEvent("error:set_mqtt_no_change");
+        } else {
+            doSetMqtt(newServer, newPort, newUser, newPass, newId);
         }
 
     // ── ota ──

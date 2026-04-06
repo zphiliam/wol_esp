@@ -74,6 +74,20 @@
 > `val` 范围：10 ~ 3600
 > `val` 为 0 时禁用状态上报
 
+### 在线更新 MQTT 连接配置
+
+```json
+{"cmd":"set_mqtt","server":"new.broker.example.com","port":8883,"user":"newuser","pass":"newpass","id":"new_id"}
+```
+
+- 所有字段均为可选，省略的字段保留当前值；但**至少需提供一个与当前配置不同的字段**
+- 执行流程：
+  1. 断开当前 MQTT 连接
+  2. 用独立临时客户端测试新配置的连接与认证
+  3. 测试成功 → 写入 `/config.json`，切换到新 broker，发布 `ok:mqtt_updated`
+  4. 测试失败 → 保留原配置，重连原 broker，发布 `error:mqtt_connect_failed`
+- `mqtt_id` 变更时订阅/发布主题随之更新（变更后的响应在新主题上发布）
+
 ### OTA 固件升级
 
 ```json
@@ -269,6 +283,20 @@
 {"event":"ok:status_disabled",         "uptime":123,"heap":44000}
 ```
 
+### set_mqtt 操作响应
+
+成功（已切换到新 broker，此后响应在新主题发布）：
+```json
+{"event":"ok:mqtt_updated","uptime":123,"heap":44000}
+```
+
+失败（保留原配置，在原 broker 发布）：
+```json
+{"event":"error:mqtt_connect_failed","rc":-4,"uptime":123,"heap":44000}
+```
+
+> `rc`：PubSubClient 连接状态码（负数 = TCP/TLS 错误；`1`=协议版本错误；`4`=认证失败；`5`=未授权；详见 PubSubClient 文档）
+
 ---
 
 ## 错误响应
@@ -284,3 +312,5 @@
 | `error:unknown_led_val` | 未知 LED val 值 |
 | `error:invalid_mac` | wol 指令中 `mac` 参数格式非法 |
 | `error:ota_url_missing` | ota 指令缺少 `url` 字段 |
+| `error:set_mqtt_no_change` | set_mqtt 指令所有字段均与当前配置相同 |
+| `error:mqtt_connect_failed` | set_mqtt 指令测试连接失败，原配置保留（附 `rc` 字段）|
