@@ -143,7 +143,7 @@ struct BlinkJob {
 // saveConfig / loadConfig
 // ─────────────────────────────────────────────────────────────────────────────
 bool saveConfig() {
-    StaticJsonDocument<512> doc;
+    StaticJsonDocument<768> doc;
     doc["wifi_ssid"]    = cfg.wifi_ssid;
     doc["wifi_pass"]    = cfg.wifi_pass;
     doc["mqtt_server"]  = cfg.mqtt_server;
@@ -167,7 +167,7 @@ bool loadConfig() {
     if (!LittleFS.exists("/config.json")) return false;
     File f = LittleFS.open("/config.json", "r");
     if (!f) return false;
-    StaticJsonDocument<512> doc;
+    StaticJsonDocument<768> doc;
     DeserializationError err = deserializeJson(doc, f);
     f.close();
     if (err != DeserializationError::Ok) return false;
@@ -589,25 +589,21 @@ void checkReconfigFlag() {
 // ─────────────────────────────────────────────────────────────────────────────
 // SoftAP 网页处理器
 // ─────────────────────────────────────────────────────────────────────────────
-static String buildAPPage(const String& statusHtml) {
-    String html = FPSTR(CONFIG_HTML);
-    html.replace("%STATUS%",  statusHtml);
-    html.replace("%SSID%",    String(cfg.wifi_ssid));
-    html.replace("%WPASS%",   String(cfg.wifi_pass));
-    html.replace("%WOLMAC%",  String(cfg.wol_mac));
-    html.replace("%VERSION%", FW_VERSION);
-    if (cfg.ap_full_config) {
-        String mqtt = FPSTR(MQTT_FIELDS_HTML);
-        mqtt.replace("%MQTTSVR%",  String(cfg.mqtt_server));
-        mqtt.replace("%MQTTPORT%", String(cfg.mqtt_port));
-        mqtt.replace("%MQTTUSER%", String(cfg.mqtt_user));
-        mqtt.replace("%MQTTPASS%", String(cfg.mqtt_pass));
-        mqtt.replace("%MQTTID%",   String(cfg.mqtt_id));
-        html.replace("%FULLBLOCK%", mqtt);
-    } else {
-        html.replace("%FULLBLOCK%", "");
-    }
-    return html;
+static void handleAPConfig() {
+    StaticJsonDocument<512> doc;
+    doc["ssid"]           = cfg.wifi_ssid;
+    doc["wpass"]          = cfg.wifi_pass;
+    doc["wolmac"]         = cfg.wol_mac;
+    doc["ap_full_config"] = cfg.ap_full_config;
+    doc["version"]        = FW_VERSION;
+    doc["mqtt_server"]    = cfg.mqtt_server;
+    doc["mqtt_port"]      = cfg.mqtt_port;
+    doc["mqtt_user"]      = cfg.mqtt_user;
+    doc["mqtt_pass"]      = cfg.mqtt_pass;
+    doc["mqtt_id"]        = cfg.mqtt_id;
+    String json;
+    serializeJson(doc, json);
+    apServer.send(200, "application/json", json);
 }
 
 static void handleAPScan() {
@@ -626,7 +622,7 @@ static void handleAPScan() {
 }
 
 static void handleAPRoot() {
-    apServer.send(200, "text/html", buildAPPage(""));
+    apServer.send(200, "text/html", FPSTR(CONFIG_HTML));
 }
 
 static void handleAPSave() {
@@ -656,8 +652,12 @@ static void handleAPSave() {
     }
 
     if (err.length() > 0) {
-        String msg = "<div class=\"msg err\">" + err + "</div>";
-        apServer.send(400, "text/html", buildAPPage(msg));
+        StaticJsonDocument<192> errDoc;
+        errDoc["ok"]    = false;
+        errDoc["error"] = err;
+        String errJson;
+        serializeJson(errDoc, errJson);
+        apServer.send(400, "application/json", errJson);
         return;
     }
 
@@ -673,7 +673,7 @@ static void handleAPSave() {
         strlcpy(cfg.mqtt_server, mqttsvr.c_str(), sizeof(cfg.mqtt_server));
         int port = apServer.arg("mqttport").toInt();
         cfg.mqtt_port = (port > 0 && port <= 65535) ? (uint16_t)port : 8883;
-        strlcpy(cfg.mqtt_user, apServer.arg("mqttuser").c_str(), sizeof(cfg.mqtt_user));
+        { String v = apServer.arg("mqttuser"); v.trim(); strlcpy(cfg.mqtt_user, v.c_str(), sizeof(cfg.mqtt_user)); }
         strlcpy(cfg.mqtt_pass, apServer.arg("mqttpass").c_str(), sizeof(cfg.mqtt_pass));
         strlcpy(cfg.mqtt_id,   mqttid.c_str(),  sizeof(cfg.mqtt_id));
     }
@@ -681,16 +681,7 @@ static void handleAPSave() {
     saveConfig();
     Serial.println(F("[AP] config saved, rebooting..."));
 
-    apServer.send(200, "text/html",
-        F("<!DOCTYPE html><html><head><meta charset='UTF-8'>"
-          "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-          "<style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;"
-          "justify-content:center;min-height:100vh;background:#f1f5f9;margin:0}"
-          ".card{background:#fff;border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.09);"
-          "padding:32px 36px;text-align:center;max-width:320px}"
-          "h2{color:#16a34a;margin-bottom:8px}p{color:#64748b;font-size:.9rem}</style></head>"
-          "<body><div class='card'><h2>✓ 保存成功</h2>"
-          "<p>配置已写入，设备正在重启，请稍候...</p></div></body></html>"));
+    apServer.send(200, "application/json", F("{\"ok\":true}"));
     delay(1500);
     ESP.restart();
 }
@@ -731,9 +722,10 @@ void enterSoftAPMode() {
     Serial.println(F("[AP] Connect to the AP, then open http://192.168.4.1"));
     Serial.printf("[AP] ap_full_config = %s\n", cfg.ap_full_config ? "true (all fields)" : "false (wifi+mac only)");
 
-    apServer.on("/",      HTTP_GET,  handleAPRoot);
-    apServer.on("/scan",  HTTP_GET,  handleAPScan);
-    apServer.on("/save",  HTTP_POST, handleAPSave);
+    apServer.on("/",       HTTP_GET,  handleAPRoot);
+    apServer.on("/config", HTTP_GET,  handleAPConfig);
+    apServer.on("/scan",   HTTP_GET,  handleAPScan);
+    apServer.on("/save",   HTTP_POST, handleAPSave);
     apServer.onNotFound([]() {
         apServer.sendHeader("Location", "http://192.168.4.1/");
         apServer.send(302, "text/plain", "");
@@ -994,10 +986,13 @@ void doOTA(const char* urlParam) {
 
     // 1. 发布 ota_start（此时 MQTT 仍连接）
     {
+        StaticJsonDocument<320> doc;
+        doc["event"]  = "ota_start";
+        doc["url"]    = url;
+        doc["uptime"] = millis() / 1000;
+        doc["heap"]   = ESP.getFreeHeap();
         char buf[320];
-        snprintf(buf, sizeof(buf),
-            "{\"event\":\"ota_start\",\"url\":\"%s\",\"uptime\":%lu,\"heap\":%u}",
-            url, millis() / 1000, ESP.getFreeHeap());
+        serializeJson(doc, buf, sizeof(buf));
         mqtt.publish(TOPIC_PUB, buf);
     }
     delay(300);  // 等待 MQTT 发送完成
@@ -1107,10 +1102,13 @@ void doOTA(const char* urlParam) {
             millis() / 1000, ESP.getFreeHeap());
         mqtt.publish(TOPIC_PUB, buf);
     } else {
+        StaticJsonDocument<256> doc;
+        doc["event"]  = "ota_fail";
+        doc["reason"] = failReason;
+        doc["uptime"] = millis() / 1000;
+        doc["heap"]   = ESP.getFreeHeap();
         char buf[256];
-        snprintf(buf, sizeof(buf),
-            "{\"event\":\"ota_fail\",\"reason\":\"%s\",\"uptime\":%lu,\"heap\":%u}",
-            failReason.c_str(), millis() / 1000, ESP.getFreeHeap());
+        serializeJson(doc, buf, sizeof(buf));
         mqtt.publish(TOPIC_PUB, buf);
     }
     delay(500);
@@ -1134,13 +1132,8 @@ void doSetMqtt(const char* newServer, uint16_t newPort,
     Serial.printf("[SET_MQTT] testing → %s:%u  user=%s  id=%s\n",
         testServer, testPort, testUser, testId);
 
-    // 2. 断开当前 MQTT（释放 TLS 资源），并保存原配置副本用于失败回退
-    char   origServer[64];  strlcpy(origServer, cfg.mqtt_server, sizeof(origServer));
-    uint16_t origPort  = cfg.mqtt_port;
-    char   origUser[64];    strlcpy(origUser,   cfg.mqtt_user,   sizeof(origUser));
-    char   origPass[64];    strlcpy(origPass,   cfg.mqtt_pass,   sizeof(origPass));
-    char   origId[32];      strlcpy(origId,     cfg.mqtt_id,     sizeof(origId));
-
+    // 2. 断开当前 MQTT（释放 TLS 资源）
+    // 失败时直接用 cfg.* 回退（cfg 在失败分支中未被修改）
     mqtt.disconnect();
     delay(100);
 
@@ -1186,9 +1179,9 @@ void doSetMqtt(const char* newServer, uint16_t newPort,
         pubEvent("ok:mqtt_updated");
 
     } else {
-        // 4b. 恢复原配置，重连原 broker
+        // 4b. cfg 未变，直接用原配置重连
         Serial.println(F("[SET_MQTT] reverting to original broker"));
-        mqtt.setServer(origServer, origPort);
+        mqtt.setServer(cfg.mqtt_server, cfg.mqtt_port);
 
         // cfg 未变，connectMQTT 会用 cfg 里的凭据
         connectMQTT();
@@ -1205,7 +1198,8 @@ void doSetMqtt(const char* newServer, uint16_t newPort,
 // mqttCallback：处理下行指令
 // ─────────────────────────────────────────────────────────────────────────────
 void mqttCallback(char* topic, byte* payload, unsigned int len) {
-    char msg[512] = {};
+    // OTA 命令为最大入参（URL≤511 + JSON开销~30 ≈ 541），640 有足够余量
+    char msg[640] = {};
     if (len >= sizeof(msg)) len = sizeof(msg) - 1;
     memcpy(msg, payload, len);
     int end = (int)strlen(msg) - 1;
@@ -1423,13 +1417,14 @@ void connectWiFiMulti() {
         }
     }
     WiFi.scanDelete();
+    uint8_t visibleCount = orderCount;  // 第一轮结束后保存可见数，第二轮会修改 orderCount
     // 不可见的追加到末尾作为隐藏网络兜底
     for (uint8_t i = 0; i < wifiCount; i++) {
         bool already = false;
         for (uint8_t j = 0; j < orderCount; j++) if (order[j] == i) { already = true; break; }
         if (!already) order[orderCount++] = i;
     }
-    Serial.printf("[WiFi] %d visible, %d total candidate(s)\n", orderCount - (wifiCount - orderCount), wifiCount);
+    Serial.printf("[WiFi] %d visible, %d total candidate(s)\n", visibleCount, wifiCount);
 #else
     // ESP8266：按列表顺序盲试
     for (uint8_t i = 0; i < wifiCount; i++) order[orderCount++] = i;
@@ -1661,7 +1656,7 @@ void setup() {
     mqtt.setCallback(mqttCallback);
     mqtt.setKeepAlive(CONF_MQTT_KEEPALIVE);
     mqtt.setSocketTimeout(MQTT_SOCK_TIMEOUT);
-    mqtt.setBufferSize(768);
+    mqtt.setBufferSize(1024);
 
     connectMQTT();
 }

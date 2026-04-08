@@ -2,7 +2,8 @@
 #include <pgmspace.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SoftAP 配置网页（PROGMEM，节省 ESP8266 堆内存）
+// SoftAP 配置网页（PROGMEM）
+// 动态数据由前端 fetch GET /config 填充；表单提交 fetch POST /save，响应 JSON。
 // ─────────────────────────────────────────────────────────────────────────────
 static const char CONFIG_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
 <html lang="zh-CN">
@@ -30,42 +31,69 @@ button:hover{background:var(--ch)}
 .ok{background:#f0fdf4;color:#16a34a;border:1px solid #bbf7d0}
 footer{text-align:center;color:var(--sub);font-size:.74rem;margin-top:18px}
 .pw-wrap{position:relative}.pw-eye{position:absolute!important;right:7px;top:50%;transform:translateY(-50%);width:auto!important;padding:3px!important;background:none!important;border:none!important;margin:0!important;cursor:pointer;color:var(--sub);display:flex;align-items:center;border-radius:4px;line-height:0}.pw-eye:hover{background:#f1f5f9!important;color:var(--txt)}
+#mq{display:none}
 </style>
 </head>
 <body>
 <div class="card">
 <h2>WoL 设备配置</h2>
 <p class="sub">连接到此 AP 后在浏览器中打开 192.168.4.1</p>
-%STATUS%
-<form method="POST" action="/save">
+<div id="msg"></div>
+<form id="frm">
 <div class="sec">WiFi</div>
-<div class="f"><label>SSID <span style="color:var(--ce)">*</span><button type="button" id="sb" onclick="doScan()" style="float:right;width:auto;padding:3px 10px;font-size:.78rem;margin:0;border-radius:5px">扫描</button></label><div style="position:relative"><input name="ssid" id="si" type="text" maxlength="32" value="%SSID%" required placeholder="WiFi 名称" autocomplete="off"><div id="sl" style="display:none;position:absolute;top:100%;left:0;right:0;background:#fff;border:1.5px solid var(--c);border-radius:6px;margin-top:4px;max-height:200px;overflow-y:auto;z-index:99;box-shadow:0 4px 12px rgba(0,0,0,.12)"></div></div></div>
-<div class="f"><label>密码</label><div class="pw-wrap"><input name="wpass" id="pw0" type="password" maxlength="63" value="%WPASS%" placeholder="留空表示无密码" autocomplete="current-password" style="padding-right:38px"><button type="button" class="pw-eye" onclick="tpw('pw0',this)"><svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button></div></div>
+<div class="f"><label>SSID <span style="color:var(--ce)">*</span><button type="button" id="sb" onclick="doScan()" style="float:right;width:auto;padding:3px 10px;font-size:.78rem;margin:0;border-radius:5px">扫描</button></label><div style="position:relative"><input name="ssid" id="si" type="text" maxlength="32" required placeholder="WiFi 名称" autocomplete="off"><div id="sl" style="display:none;position:absolute;top:100%;left:0;right:0;background:#fff;border:1.5px solid var(--c);border-radius:6px;margin-top:4px;max-height:200px;overflow-y:auto;z-index:99;box-shadow:0 4px 12px rgba(0,0,0,.12)"></div></div></div>
+<div class="f"><label>密码</label><div class="pw-wrap"><input name="wpass" id="pw0" type="password" maxlength="63" placeholder="留空表示无密码" autocomplete="current-password" style="padding-right:38px"><button type="button" class="pw-eye" id="peb0" onclick="tpw('pw0','peb0')"></button></div></div>
 <div class="sec">WoL 目标</div>
-<div class="f"><label>目标 MAC 地址 <span style="color:var(--ce)">*</span></label><input name="wolmac" type="text" maxlength="12" pattern="[0-9A-Fa-f]{12}" value="%WOLMAC%" required placeholder="AABBCCDDEEFF（12 位十六进制，无分隔符）"></div>
-%FULLBLOCK%
-<button type="submit">保存并重启</button>
+<div class="f"><label>目标 MAC 地址 <span style="color:var(--ce)">*</span></label><input name="wolmac" type="text" maxlength="12" pattern="[0-9A-Fa-f]{12}" required placeholder="AABBCCDDEEFF（12 位十六进制，无分隔符）"></div>
+<div id="mq">
+<div class="sec">MQTT</div>
+<div class="f"><label>服务器地址 <span style="color:var(--ce)">*</span></label><input name="mqttsvr" type="text" maxlength="63" placeholder="broker.example.com"></div>
+<div class="f"><label>端口</label><input name="mqttport" type="number" min="1" max="65535" value="8883"></div>
+<div class="f"><label>用户名</label><input name="mqttuser" type="text" maxlength="63" placeholder="（可选）"></div>
+<div class="f"><label>密码</label><div class="pw-wrap"><input name="mqttpass" id="pw1" type="password" maxlength="63" placeholder="（可选）" autocomplete="current-password" style="padding-right:38px"><button type="button" class="pw-eye" id="peb1" onclick="tpw('pw1','peb1')"></button></div></div>
+<div class="f"><label>Client ID <span style="color:var(--ce)">*</span></label><input name="mqttid" type="text" maxlength="31" placeholder="wol-device-1"></div>
+</div>
+<button type="submit" id="btn">保存并重启</button>
 </form>
-<footer>固件版本 %VERSION%</footer>
+<footer id="ver"></footer>
 </div>
 <script>
-function doScan(){var b=document.getElementById('sb');b.textContent='扫描中…';b.disabled=true;fetch('/scan').then(function(r){return r.json()}).then(function(list){var d=document.getElementById('sl');d.innerHTML='';list.forEach(function(s){var item=document.createElement('div');item.textContent=s;item.style.cssText='padding:11px 14px;cursor:pointer;font-size:.9rem;border-bottom:1px solid #f1f5f9';item.addEventListener('touchstart',function(){item.style.background='#eff6ff'});item.addEventListener('touchend',function(){document.getElementById('si').value=s;d.style.display='none';item.style.background=''});item.addEventListener('mousedown',function(){document.getElementById('si').value=s;d.style.display='none'});d.appendChild(item)});if(list.length>0)d.style.display='block';b.textContent='重新扫描('+list.length+')';b.disabled=false}).catch(function(){b.textContent='重试';b.disabled=false})}
-document.addEventListener('click',function(e){var d=document.getElementById('sl');var si=document.getElementById('si');if(d&&e.target===si){if(d.children.length>0)d.style.display='block';}else if(d){d.style.display='none';}});
+var EON='<svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+var EOFF='<svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+document.getElementById('peb0').innerHTML=EON;
+document.getElementById('peb1').innerHTML=EON;
+function tpw(id,bid){var i=document.getElementById(id),b=document.getElementById(bid),s=i.type==='password';i.type=s?'text':'password';b.innerHTML=s?EOFF:EON}
+function q(n){return document.querySelector('[name='+n+']')}
+function showMsg(t,ok){document.getElementById('msg').innerHTML='<div class="msg '+(ok?'ok':'err')+'">'+t+'</div>'}
+fetch('/config').then(function(r){return r.json()}).then(function(d){
+  q('ssid').value=d.ssid||'';
+  q('wpass').value=d.wpass||'';
+  q('wolmac').value=d.wolmac||'';
+  if(d.ap_full_config){
+    document.getElementById('mq').style.display='block';
+    q('mqttsvr').value=d.mqtt_server||'';
+    q('mqttport').value=d.mqtt_port||8883;
+    q('mqttuser').value=d.mqtt_user||'';
+    q('mqttpass').value=d.mqtt_pass||'';
+    q('mqttid').value=d.mqtt_id||'';
+  }
+  document.getElementById('ver').textContent='固件版本 '+(d.version||'');
+}).catch(function(){showMsg('加载配置失败，请刷新页面。',false)});
+document.getElementById('frm').addEventListener('submit',function(e){
+  e.preventDefault();
+  var btn=document.getElementById('btn');
+  btn.disabled=true;btn.textContent='保存中…';
+  fetch('/save',{method:'POST',body:new URLSearchParams(new FormData(this)),headers:{'Content-Type':'application/x-www-form-urlencoded'}})
+  .then(function(r){return r.json()})
+  .then(function(d){
+    if(d.ok){showMsg('配置已写入，设备正在重启，请稍候…',true);btn.style.display='none';}
+    else{showMsg(d.error||'保存失败',false);btn.disabled=false;btn.textContent='保存并重启';}
+  }).catch(function(){showMsg('请求失败，请重试。',false);btn.disabled=false;btn.textContent='保存并重启'});
+});
+function doScan(){var b=document.getElementById('sb');b.textContent='扫描中…';b.disabled=true;fetch('/scan').then(function(r){return r.json()}).then(function(list){var d=document.getElementById('sl');d.innerHTML='';list.forEach(function(s){var item=document.createElement('div');item.textContent=s;item.style.cssText='padding:11px 14px;cursor:pointer;font-size:.9rem;border-bottom:1px solid #f1f5f9';var scrolled=false,startY=0;item.addEventListener('touchstart',function(e){startY=e.touches[0].clientY;scrolled=false});item.addEventListener('touchmove',function(e){if(Math.abs(e.touches[0].clientY-startY)>10)scrolled=true;item.style.background=''});item.addEventListener('touchend',function(){if(!scrolled){document.getElementById('si').value=s;d.style.display='none'}item.style.background=''});item.addEventListener('mousedown',function(){document.getElementById('si').value=s;d.style.display='none'});d.appendChild(item)});if(list.length>0)d.style.display='block';b.textContent='重新扫描('+list.length+')';b.disabled=false}).catch(function(){b.textContent='重试';b.disabled=false})}
+document.addEventListener('click',function(e){var d=document.getElementById('sl'),si=document.getElementById('si');if(d&&e.target===si){if(d.children.length>0)d.style.display='block';}else if(d){d.style.display='none';}});
 window.addEventListener('load',doScan);
-var EYE_ON='<svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
-var EYE_OFF='<svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
-function tpw(id,btn){var inp=document.getElementById(id);var show=inp.type==='password';inp.type=show?'text':'password';btn.innerHTML=show?EYE_OFF:EYE_ON}
 </script>
 </body>
 </html>
-)=====";
-
-// MQTT 字段块（ap_full_config=true 时插入 %FULLBLOCK%）
-static const char MQTT_FIELDS_HTML[] PROGMEM = R"=====(
-<div class="sec">MQTT</div>
-<div class="f"><label>服务器地址 <span style="color:var(--ce)">*</span></label><input name="mqttsvr" type="text" maxlength="63" value="%MQTTSVR%" required placeholder="broker.example.com"></div>
-<div class="f"><label>端口</label><input name="mqttport" type="number" min="1" max="65535" value="%MQTTPORT%"></div>
-<div class="f"><label>用户名</label><input name="mqttuser" type="text" maxlength="63" value="%MQTTUSER%" placeholder="（可选）"></div>
-<div class="f"><label>密码</label><div class="pw-wrap"><input name="mqttpass" id="pw1" type="password" maxlength="63" value="%MQTTPASS%" placeholder="（可选）" autocomplete="current-password" style="padding-right:38px"><button type="button" class="pw-eye" onclick="tpw('pw1',this)"><svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button></div></div>
-<div class="f"><label>Client ID <span style="color:var(--ce)">*</span></label><input name="mqttid" type="text" maxlength="31" value="%MQTTID%" required placeholder="wol-device-1"></div>
 )=====";
