@@ -87,14 +87,21 @@ struct DevConfig {
     int8_t   wifi_tx_power;  // WiFi 发射功率（dBm，2-20）；0 表示使用平台默认值
 } cfg;
 
-// ── WiFi 历史网络列表 ─────────────────────────────────────────────────────────
+// ── WiFi 历史网络 LRU 缓存（固定池双向链表）─────────────────────────────────
+// 头部 = 最近使用，尾部 = 最久未用（满时淘汰）
+// int8_t 存 prev/next（N≤5，范围 -1~4 完全够用，每节点仅多 3 字节开销）
 #define WIFI_MAX_NETWORKS 5
-struct WifiNetwork {
-    char ssid[33];
-    char pass[64];
+struct WifiNode {
+    char   ssid[33];
+    char   pass[64];
+    int8_t prev;   // 链表中上一节点在池中的索引，-1 = 无
+    int8_t next;   // 链表中下一节点在池中的索引，-1 = 无
+    bool   used;   // 是否被占用
 };
-WifiNetwork wifiNetworks[WIFI_MAX_NETWORKS];
-int         wifiNetworkCount = 0;
+static WifiNode wifiPool[WIFI_MAX_NETWORKS];
+static int8_t   wifiHead  = -1;  // 最近使用端（索引）
+static int8_t   wifiTail  = -1;  // 最久未用端（索引）
+static uint8_t  wifiCount =  0;
 
 // ── MQTT 主题（运行时由 cfg.mqtt_id 填充） ─────────────────────────────────────
 char TOPIC_SUB[64];
@@ -189,28 +196,110 @@ bool loadConfig() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// saveWifiNetworks / loadWifiNetworks / addOrUpdateWifiNetwork
-// 历史 WiFi 网络持久化到 /wifi_networks.json，最多 WIFI_MAX_NETWORKS 条
-// 列表头部 = 最近成功连接的网络（启动时优先尝试）
+// LRU WiFi 历史缓存：内部工具 + 公共接口
+// 持久化到 /wifi_networks.json，格式不变（兼容旧固件）
 // ─────────────────────────────────────────────────────────────────────────────
+
+// 从池中找空闲槽（count < MAX 时必然存在）
+static int8_t lruAlloc() {
+    for (int8_t i = 0; i < WIFI_MAX_NETWORKS; i++)
+        if (!wifiPool[i].used) return i;
+    return -1;
+}
+
+// 按 SSID 查找节点索引，不存在返回 -1
+static int8_t lruFind(const char* ssid) {
+    for (int8_t cur = wifiHead; cur != -1; cur = wifiPool[cur].next)
+        if (strcmp(wifiPool[cur].ssid, ssid) == 0) return cur;
+    return -1;
+}
+
+// 将节点从链表中摘下（不释放槽位）
+static void lruDetach(int8_t i) {
+    int8_t p = wifiPool[i].prev, n = wifiPool[i].next;
+    if (p != -1) wifiPool[p].next = n; else wifiHead = n;
+    if (n != -1) wifiPool[n].prev = p; else wifiTail = p;
+    wifiPool[i].prev = wifiPool[i].next = -1;
+}
+
+// 将节点插到链表头部
+static void lruPushHead(int8_t i) {
+    wifiPool[i].prev = -1;
+    wifiPool[i].next = wifiHead;
+    if (wifiHead != -1) wifiPool[wifiHead].prev = i;
+    wifiHead = i;
+    if (wifiTail == -1) wifiTail = i;
+}
+
+// 添加或更新：已存在则更新密码并移到头部；已满则淘汰尾部后插入头部
+void lruAddOrUpdate(const char* ssid, const char* pass) {
+    if (!ssid || ssid[0] == '\0') return;
+
+    int8_t idx = lruFind(ssid);
+    if (idx != -1) {
+        strlcpy(wifiPool[idx].pass, pass, sizeof(wifiPool[0].pass));
+        if (idx != wifiHead) { lruDetach(idx); lruPushHead(idx); }
+        return;
+    }
+    if (wifiCount >= WIFI_MAX_NETWORKS) {
+        int8_t evict = wifiTail;
+        lruDetach(evict);
+        wifiPool[evict].used = false;
+        wifiCount--;
+    }
+    idx = lruAlloc();
+    strlcpy(wifiPool[idx].ssid, ssid, sizeof(wifiPool[0].ssid));
+    strlcpy(wifiPool[idx].pass, pass, sizeof(wifiPool[0].pass));
+    wifiPool[idx].prev = wifiPool[idx].next = -1;
+    wifiPool[idx].used = true;
+    lruPushHead(idx);
+    wifiCount++;
+}
+
+// 按顺序位置删除（pos=0 为头部/最近），返回是否成功
+bool lruRemoveAt(uint8_t pos) {
+    int8_t cur = wifiHead;
+    for (uint8_t i = 0; i < pos && cur != -1; i++) cur = wifiPool[cur].next;
+    if (cur == -1) return false;
+    lruDetach(cur);
+    wifiPool[cur].used = false;
+    wifiCount--;
+    return true;
+}
+
+// 按顺序位置读取（pos=0 = 最近），越界返回 nullptr
+const WifiNode* lruGet(uint8_t pos) {
+    int8_t cur = wifiHead;
+    for (uint8_t i = 0; i < pos && cur != -1; i++) cur = wifiPool[cur].next;
+    return (cur != -1) ? &wifiPool[cur] : nullptr;
+}
+
+// 重置缓存（清除所有节点）
+void lruInit() {
+    memset(wifiPool, 0, sizeof(wifiPool));
+    wifiHead = wifiTail = -1;
+    wifiCount = 0;
+}
+
 void saveWifiNetworks() {
     StaticJsonDocument<768> doc;
     JsonArray arr = doc.to<JsonArray>();
-    for (int i = 0; i < wifiNetworkCount; i++) {
+    for (uint8_t i = 0; i < wifiCount; i++) {
+        const WifiNode* n = lruGet(i);
         JsonObject obj = arr.createNestedObject();
-        obj["ssid"] = wifiNetworks[i].ssid;
-        obj["pass"] = wifiNetworks[i].pass;
+        obj["ssid"] = n->ssid;
+        obj["pass"] = n->pass;
     }
     File f = LittleFS.open("/wifi_networks.json", "w");
     if (!f) { Serial.println(F("[WiFi] saveWifiNetworks: open failed")); return; }
     serializeJson(doc, f);
     f.close();
-    Serial.printf("[WiFi] saved %d network(s) to wifi_networks.json\n", wifiNetworkCount);
+    Serial.printf("[WiFi] saved %d network(s) to wifi_networks.json\n", wifiCount);
 }
 
 // 返回 true 表示至少有一条可用网络
 bool loadWifiNetworks() {
-    wifiNetworkCount = 0;
+    lruInit();
     if (LittleFS.exists("/wifi_networks.json")) {
         File f = LittleFS.open("/wifi_networks.json", "r");
         if (f) {
@@ -218,53 +307,32 @@ bool loadWifiNetworks() {
             DeserializationError err = deserializeJson(doc, f);
             f.close();
             if (err == DeserializationError::Ok && doc.is<JsonArray>()) {
-                for (JsonObject obj : doc.as<JsonArray>()) {
-                    if (wifiNetworkCount >= WIFI_MAX_NETWORKS) break;
+                // 文件头部 = 最近使用，逆序插入使头部保持顺序
+                // lruAddOrUpdate 自带去重：若 SSID 已存在则更新密码并移头，不会产生重复节点
+                JsonArray arr = doc.as<JsonArray>();
+                int total = arr.size();
+                for (int i = total - 1; i >= 0; i--) {
+                    JsonObject obj = arr[i];
                     const char* ssid = obj["ssid"] | "";
-                    if (strlen(ssid) == 0) continue;
-                    strlcpy(wifiNetworks[wifiNetworkCount].ssid, ssid,          sizeof(wifiNetworks[0].ssid));
-                    strlcpy(wifiNetworks[wifiNetworkCount].pass, obj["pass"] | "", sizeof(wifiNetworks[0].pass));
-                    wifiNetworkCount++;
+                    if (ssid[0] == '\0') continue;
+                    lruAddOrUpdate(ssid, obj["pass"] | "");
+                }
+                // 若文件里有重复条目（旧固件遗留），加载后条数会减少，回写一次清理
+                if ((int)wifiCount < total) {
+                    Serial.printf("[WiFi] dedup: %d → %d, rewriting\n", total, wifiCount);
+                    saveWifiNetworks();
                 }
             }
         }
     }
     // 迁移：旧版本只有 config.json 没有 wifi_networks.json，自动迁移一次
-    if (wifiNetworkCount == 0 && strlen(cfg.wifi_ssid) > 0) {
-        Serial.println(F("[WiFi] migrating wifi_ssid from config.json to wifi_networks.json"));
-        strlcpy(wifiNetworks[0].ssid, cfg.wifi_ssid, sizeof(wifiNetworks[0].ssid));
-        strlcpy(wifiNetworks[0].pass, cfg.wifi_pass, sizeof(wifiNetworks[0].pass));
-        wifiNetworkCount = 1;
+    if (wifiCount == 0 && cfg.wifi_ssid[0] != '\0') {
+        Serial.println(F("[WiFi] migrating wifi_ssid from config.json"));
+        lruAddOrUpdate(cfg.wifi_ssid, cfg.wifi_pass);
         saveWifiNetworks();
     }
-    Serial.printf("[WiFi] %d network(s) in history\n", wifiNetworkCount);
-    return wifiNetworkCount > 0;
-}
-
-// 将指定网络移至列表头部（最近使用优先）；若不在列表中则插入；超出上限时淘汰最旧条目
-// 注意：ssid/pass 可能指向 wifiNetworks[] 内部，shift 操作会覆盖原始数据，
-//       因此先复制到本地缓冲区，避免指针别名（pointer aliasing）问题。
-void addOrUpdateWifiNetwork(const char* ssid, const char* pass) {
-    if (strlen(ssid) == 0) return;
-    char ssidBuf[33]; strlcpy(ssidBuf, ssid, sizeof(ssidBuf));
-    char passBuf[64]; strlcpy(passBuf, pass, sizeof(passBuf));
-    ssid = ssidBuf; pass = passBuf;
-    // 若已存在则先从当前位置移除
-    for (int i = 0; i < wifiNetworkCount; i++) {
-        if (strcmp(wifiNetworks[i].ssid, ssid) == 0) {
-            for (int j = i; j < wifiNetworkCount - 1; j++) wifiNetworks[j] = wifiNetworks[j + 1];
-            wifiNetworkCount--;
-            break;
-        }
-    }
-    // 列表已满则丢弃最旧（末尾）条目
-    if (wifiNetworkCount >= WIFI_MAX_NETWORKS) wifiNetworkCount--;
-    // 将所有条目后移一位，腾出头部
-    for (int i = wifiNetworkCount; i > 0; i--) wifiNetworks[i] = wifiNetworks[i - 1];
-    // 写入头部
-    strlcpy(wifiNetworks[0].ssid, ssid, sizeof(wifiNetworks[0].ssid));
-    strlcpy(wifiNetworks[0].pass, pass, sizeof(wifiNetworks[0].pass));
-    wifiNetworkCount++;
+    Serial.printf("[WiFi] %d network(s) in history\n", wifiCount);
+    return wifiCount > 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -279,11 +347,11 @@ void writeFlag(const char* path) {
 // printWifiHistory：打印 WiFi 历史列表（两处 show 共用）
 // ─────────────────────────────────────────────────────────────────────────────
 static void printWifiHistory() {
-    if (wifiNetworkCount == 0) {
+    if (wifiCount == 0) {
         Serial.println(F("  (empty)"));
     } else {
-        for (int i = 0; i < wifiNetworkCount; i++)
-            Serial.printf("  [%d] %s\n", i, wifiNetworks[i].ssid);
+        for (uint8_t i = 0; i < wifiCount; i++)
+            Serial.printf("  [%d] %s\n", i, lruGet(i)->ssid);
     }
 }
 
@@ -318,6 +386,7 @@ static void printConfigHelp() {
 void enterConfigMode() {
     DevConfig staged = cfg;                         // 以当前配置为起点（可能全空）
     if (staged.mqtt_port == 0) staged.mqtt_port = 8883;
+    bool explicitSsid = false;                      // 用户是否显式执行过 set wifi_ssid
 
     printConfigHelp();
 
@@ -368,46 +437,45 @@ void enterConfigMode() {
                 Serial.println(F("---------------------------"));
 
             } else if (line == "wifi list") {
-                if (wifiNetworkCount == 0) {
+                if (wifiCount == 0) {
                     Serial.println(F("[WiFi] history empty"));
                 } else {
-                    Serial.printf("[WiFi] %d network(s):\n", wifiNetworkCount);
-                    for (int i = 0; i < wifiNetworkCount; i++)
-                        Serial.printf("  [%d] %s\n", i, wifiNetworks[i].ssid);
+                    Serial.printf("[WiFi] %d network(s):\n", wifiCount);
+                    for (uint8_t i = 0; i < wifiCount; i++)
+                        Serial.printf("  [%d] %s\n", i, lruGet(i)->ssid);
                 }
 
             } else if (line.startsWith("wifi del ")) {
                 int idx = line.substring(9).toInt();
-                if (idx < 0 || idx >= wifiNetworkCount) {
-                    Serial.printf("[WiFi] invalid index %d (0-%d)\n", idx, wifiNetworkCount - 1);
+                if (idx < 0 || (uint8_t)idx >= wifiCount) {
+                    Serial.printf("[WiFi] invalid index %d (0-%d)\n", idx, wifiCount - 1);
                 } else {
-                    Serial.printf("[WiFi] removing [%d] %s\n", idx, wifiNetworks[idx].ssid);
-                    for (int i = idx; i < wifiNetworkCount - 1; i++) wifiNetworks[i] = wifiNetworks[i + 1];
-                    wifiNetworkCount--;
+                    Serial.printf("[WiFi] removing [%d] %s\n", idx, lruGet(idx)->ssid);
+                    lruRemoveAt(idx);
                     saveWifiNetworks();
                 }
 
             } else if (line == "save") {
                 bool ok = true;
-                // wifi_ssid 在历史列表不为空时可省略（复用已有列表）
-                bool hasWifiInList = wifiNetworkCount > 0;
-                bool hasStagedSsid = strlen(staged.wifi_ssid) > 0;
-                if (!hasWifiInList && !hasStagedSsid) { Serial.println(F("[CFG] error: wifi_ssid required (or use 'wifi list' to check history)")); ok = false; }
-                if (strlen(staged.mqtt_server) == 0) { Serial.println(F("[CFG] error: mqtt_server required")); ok = false; }
-                if (strlen(staged.mqtt_id)     == 0) { Serial.println(F("[CFG] error: mqtt_id required"));     ok = false; }
+                if (wifiCount == 0 && !explicitSsid) { Serial.println(F("[CFG] error: wifi_ssid required (or use 'wifi list' to check history)")); ok = false; }
+                if (staged.mqtt_server[0] == '\0') { Serial.println(F("[CFG] error: mqtt_server required")); ok = false; }
+                if (staged.mqtt_id[0]     == '\0') { Serial.println(F("[CFG] error: mqtt_id required"));     ok = false; }
                 { bool hexOk = (strlen(staged.wol_mac) == 12);
                   for (int i = 0; hexOk && i < 12; i++) hexOk = isxdigit((unsigned char)staged.wol_mac[i]);
                   if (!hexOk) { Serial.println(F("[CFG] error: wol_mac must be 12 hex chars")); ok = false; } }
                 if (ok) {
-                    // 若用户 set 了新的 wifi_ssid，追加到历史列表头部
-                    if (hasStagedSsid) {
-                        addOrUpdateWifiNetwork(staged.wifi_ssid, staged.wifi_pass);
+                    // 仅当用户显式执行了 set wifi_ssid 时才写入历史列表
+                    if (explicitSsid) {
+                        lruAddOrUpdate(staged.wifi_ssid, staged.wifi_pass);
                         saveWifiNetworks();
                         Serial.printf("[CFG] added '%s' to wifi history\n", staged.wifi_ssid);
                     }
-                    // 更新 cfg.wifi_ssid 为列表第一条（最近/最新配置的网络）
-                    strlcpy(staged.wifi_ssid, wifiNetworks[0].ssid, sizeof(staged.wifi_ssid));
-                    strlcpy(staged.wifi_pass, wifiNetworks[0].pass, sizeof(staged.wifi_pass));
+                    // cfg.wifi_ssid 始终指向列表第一条（最近使用的网络）
+                    const WifiNode* head = lruGet(0);
+                    if (head) {
+                        strlcpy(staged.wifi_ssid, head->ssid, sizeof(staged.wifi_ssid));
+                        strlcpy(staged.wifi_pass, head->pass, sizeof(staged.wifi_pass));
+                    }
                     cfg = staged;
                     cfg.wifi_ever_ok = false;  // 重新配置后视为首次连接，超时进配置模式而非重启
                     if (saveConfig()) {
@@ -437,7 +505,7 @@ void enterConfigMode() {
             } else if (line == "reset") {
                 LittleFS.remove("/config.json");
                 LittleFS.remove("/wifi_networks.json");
-                wifiNetworkCount = 0;
+                lruInit();
                 Serial.println(F("[CFG] config + wifi history erased, rebooting..."));
                 digitalWrite(LED_PIN, HIGH);
                 delay(300);
@@ -461,7 +529,7 @@ void enterConfigMode() {
                     val.trim();
 
                     bool valid = true;
-                    if      (key == "wifi_ssid")   strlcpy(staged.wifi_ssid,   val.c_str(), sizeof(staged.wifi_ssid));
+                    if      (key == "wifi_ssid")   { strlcpy(staged.wifi_ssid, val.c_str(), sizeof(staged.wifi_ssid)); explicitSsid = true; }
                     else if (key == "wifi_pass")   strlcpy(staged.wifi_pass,   val.c_str(), sizeof(staged.wifi_pass));
                     else if (key == "mqtt_server") strlcpy(staged.mqtt_server, val.c_str(), sizeof(staged.mqtt_server));
                     else if (key == "mqtt_user")   strlcpy(staged.mqtt_user,   val.c_str(), sizeof(staged.mqtt_user));
@@ -594,10 +662,10 @@ static void handleAPSave() {
     }
 
     // 写入 cfg 并更新 WiFi 历史列表
-    addOrUpdateWifiNetwork(ssid.c_str(), wpass.c_str());
+    lruAddOrUpdate(ssid.c_str(), wpass.c_str());
     saveWifiNetworks();
-    strlcpy(cfg.wifi_ssid, wifiNetworks[0].ssid, sizeof(cfg.wifi_ssid));
-    strlcpy(cfg.wifi_pass, wifiNetworks[0].pass, sizeof(cfg.wifi_pass));
+    strlcpy(cfg.wifi_ssid, lruGet(0)->ssid, sizeof(cfg.wifi_ssid));
+    strlcpy(cfg.wifi_pass, lruGet(0)->pass, sizeof(cfg.wifi_pass));
     strlcpy(cfg.wol_mac,   wolmac.c_str(), sizeof(cfg.wol_mac));
     cfg.wifi_ever_ok = false;
 
@@ -1197,7 +1265,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
         resp["event"]           = "config";
         resp["wifi_ssid"]       = cfg.wifi_ssid;
         JsonArray nets = resp.createNestedArray("wifi_networks");
-        for (int i = 0; i < wifiNetworkCount; i++) nets.add(wifiNetworks[i].ssid);
+        for (uint8_t i = 0; i < wifiCount; i++) nets.add(lruGet(i)->ssid);
         resp["mqtt_server"]     = cfg.mqtt_server;
         resp["mqtt_port"]       = cfg.mqtt_port;
         resp["mqtt_user"]       = cfg.mqtt_user;
@@ -1319,7 +1387,7 @@ static const char* wifiStatusName(int s) {
 // ESP32-C3 先扫描，优先尝试当前可见网络；ESP8266 按列表顺序盲试。
 // 全部失败时：首次连接进配置模式，曾经连上过则重启（SDK 下次启动自动重试）。
 void connectWiFiMulti() {
-    if (wifiNetworkCount == 0) {
+    if (wifiCount == 0) {
         Serial.println(F("[WiFi] no networks in history → config mode"));
         enterConfigMode();  // 永不返回
     }
@@ -1341,39 +1409,39 @@ void connectWiFiMulti() {
     Serial.printf("[WiFi] TX power = %ddBm%s\n", cfg.wifi_tx_power,
         (cfg.wifi_tx_power == 0) ? " (platform default)" : "");
 
-    // ── 构建候选顺序 ──────────────────────────────────────────────────────────
-    int order[WIFI_MAX_NETWORKS];
-    int orderCount = 0;
+    // ── 构建候选顺序（LRU 位置索引） ─────────────────────────────────────────
+    uint8_t order[WIFI_MAX_NETWORKS];
+    uint8_t orderCount = 0;
 
 #if !defined(ESP8266)
     // ESP32-C3：先扫描，可见网络排前面（隐藏网络仍在列表末尾兜底）
     Serial.println(F("[WiFi] scanning..."));
     int scanN = WiFi.scanNetworks();
-    for (int i = 0; i < wifiNetworkCount; i++) {
+    for (uint8_t i = 0; i < wifiCount; i++) {
         for (int j = 0; j < scanN; j++) {
-            if (WiFi.SSID(j) == wifiNetworks[i].ssid) { order[orderCount++] = i; break; }
+            if (WiFi.SSID(j) == lruGet(i)->ssid) { order[orderCount++] = i; break; }
         }
     }
     WiFi.scanDelete();
     // 不可见的追加到末尾作为隐藏网络兜底
-    for (int i = 0; i < wifiNetworkCount; i++) {
+    for (uint8_t i = 0; i < wifiCount; i++) {
         bool already = false;
-        for (int j = 0; j < orderCount; j++) if (order[j] == i) { already = true; break; }
+        for (uint8_t j = 0; j < orderCount; j++) if (order[j] == i) { already = true; break; }
         if (!already) order[orderCount++] = i;
     }
-    Serial.printf("[WiFi] %d visible, %d total candidate(s)\n", orderCount - (wifiNetworkCount - orderCount), wifiNetworkCount);
+    Serial.printf("[WiFi] %d visible, %d total candidate(s)\n", orderCount - (wifiCount - orderCount), wifiCount);
 #else
     // ESP8266：按列表顺序盲试
-    for (int i = 0; i < wifiNetworkCount; i++) order[orderCount++] = i;
+    for (uint8_t i = 0; i < wifiCount; i++) order[orderCount++] = i;
 #endif
 
     // ── 逐个尝试 ─────────────────────────────────────────────────────────────
     unsigned long startMs = millis();
 
-    for (int attempt = 0; attempt < orderCount; attempt++) {
-        int idx = order[attempt];
-        Serial.printf("[WiFi] trying [%d/%d] %s\n", attempt + 1, orderCount, wifiNetworks[idx].ssid);
-        WiFi.begin(wifiNetworks[idx].ssid, wifiNetworks[idx].pass);
+    for (uint8_t attempt = 0; attempt < orderCount; attempt++) {
+        const WifiNode* n = lruGet(order[attempt]);
+        Serial.printf("[WiFi] trying [%d/%d] %s\n", attempt + 1, orderCount, n->ssid);
+        WiFi.begin(n->ssid, n->pass);
 
         unsigned long t = millis();
         bool connected = false;
@@ -1400,13 +1468,14 @@ void connectWiFiMulti() {
         if (connected) {
             wifiConnectMs = millis() - startMs;
             Serial.printf("[WiFi] connected to '%s' in %lums, IP=%s\n",
-                wifiNetworks[idx].ssid, wifiConnectMs, WiFi.localIP().toString().c_str());
+                n->ssid, wifiConnectMs, WiFi.localIP().toString().c_str());
 
             // 成功的网络移至列表头部并持久化
-            addOrUpdateWifiNetwork(wifiNetworks[idx].ssid, wifiNetworks[idx].pass);
+            // n->ssid/pass 在 lruAddOrUpdate 后仍指向同一池槽，数据不变
+            lruAddOrUpdate(n->ssid, n->pass);
             saveWifiNetworks();
-            strlcpy(cfg.wifi_ssid, wifiNetworks[0].ssid, sizeof(cfg.wifi_ssid));
-            strlcpy(cfg.wifi_pass, wifiNetworks[0].pass, sizeof(cfg.wifi_pass));
+            strlcpy(cfg.wifi_ssid, lruGet(0)->ssid, sizeof(cfg.wifi_ssid));
+            strlcpy(cfg.wifi_pass, lruGet(0)->pass, sizeof(cfg.wifi_pass));
 
             WiFi.setAutoReconnect(true);  // 交还给 SDK 处理后续断线重连
 
@@ -1558,8 +1627,8 @@ void setup() {
     Serial.println(F("------- 当前配置 ---------------"));
     Serial.printf("  固件版本   : %s\n",  FW_VERSION);
     Serial.println(F("  [WiFi 历史]"));
-    for (int i = 0; i < wifiNetworkCount; i++)
-        Serial.printf("    [%d] %s\n", i, wifiNetworks[i].ssid);
+    for (uint8_t i = 0; i < wifiCount; i++)
+        Serial.printf("    [%d] %s\n", i, lruGet(i)->ssid);
     Serial.println(F("  [MQTT]"));
     Serial.printf("    服务器   : %s:%u\n", cfg.mqtt_server, cfg.mqtt_port);
     Serial.printf("    用户名   : %s\n",  cfg.mqtt_user);
