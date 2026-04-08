@@ -243,8 +243,13 @@ bool loadWifiNetworks() {
 }
 
 // 将指定网络移至列表头部（最近使用优先）；若不在列表中则插入；超出上限时淘汰最旧条目
+// 注意：ssid/pass 可能指向 wifiNetworks[] 内部，shift 操作会覆盖原始数据，
+//       因此先复制到本地缓冲区，避免指针别名（pointer aliasing）问题。
 void addOrUpdateWifiNetwork(const char* ssid, const char* pass) {
     if (strlen(ssid) == 0) return;
+    char ssidBuf[33]; strlcpy(ssidBuf, ssid, sizeof(ssidBuf));
+    char passBuf[64]; strlcpy(passBuf, pass, sizeof(passBuf));
+    ssid = ssidBuf; pass = passBuf;
     // 若已存在则先从当前位置移除
     for (int i = 0; i < wifiNetworkCount; i++) {
         if (strcmp(wifiNetworks[i].ssid, ssid) == 0) {
