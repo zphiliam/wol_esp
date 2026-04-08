@@ -2,7 +2,7 @@
 
 通过 MQTT over TLS 远程唤醒局域网内电脑，支持 ESP-12F 和 ESP32-C3 SuperMini 两款硬件，同一份代码编译时自动适配。
 
-凭据（WiFi、MQTT、WoL MAC）存于设备 LittleFS，**固件本身不含敏感信息**，烧录后通过串口 CLI 或 SoftAP 网页写入。
+凭据（WiFi、MQTT、WoL MAC）存于设备 LittleFS，**固件本身不含敏感信息**，烧录后通过串口 CLI 或 SoftAP 网页写入。支持保存多个 WiFi 网络（最多 5 条），换地方后自动轮试已保存网络并连接。
 
 ## 硬件
 
@@ -119,11 +119,13 @@ set wol_mac     <目标电脑MAC，12位十六进制无分隔符，如 AABBCCDDE
 save
 ```
 
-`save` 后设备自动重启进入正常工作模式。
+`save` 后设备自动重启进入正常工作模式。填写的 WiFi 会追加到历史列表（不覆盖已有网络）。
 
 **其他 CLI 命令：**
-- `show` — 查看当前暂存配置
-- `reset` — 清除配置并重启
+- `show` — 查看当前暂存配置及 WiFi 历史列表
+- `wifi list` — 列出所有已保存的 WiFi 网络
+- `wifi del <n>` — 删除第 n 条 WiFi 历史记录（从 0 开始）
+- `reset` — 清除全部配置（含 WiFi 历史）并重启
 - `help` — 显示帮助
 
 ### 3. 验证
@@ -131,7 +133,7 @@ save
 在 MQTT 客户端订阅 `home/wol/<mqtt_id>/event`，收到如下消息即表示上线成功：
 
 ```json
-{"event":"online","version":"2.3.2-20260402","uptime":3,"heap":44000,"ip":"192.168.1.x"}
+{"event":"online","version":"2.4.0-20260408","uptime":3,"heap":44000,"ip":"192.168.1.x"}
 ```
 
 ---

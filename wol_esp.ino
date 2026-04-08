@@ -24,9 +24,8 @@
  *   {"cmd":"wol"}                              唤醒电脑
  *   {"cmd":"ping"}                             测试连通性
  *   {"cmd":"reboot"}                           重启设备
- *   {"cmd":"info"}                             查询设备信息
- *   {"cmd":"show"}                             查询完整状态（配置+运行时信息）
- *   {"cmd":"config"}                           查询所有配置
+ *   {"cmd":"info"}                             查询设备运行状态（version/ssid/rssi/wol_mac/reconnects）
+ *   {"cmd":"config"}                           查询完整配置（含 wifi_networks 列表）
  *   {"cmd":"led","val":"on|off|toggle|query"}  控制 LED
  *   {"cmd":"led","val":"blink","times":5,"interval":500}
  *   {"cmd":"set","key":"status_interval","val":30}  设置状态上报间隔（秒，0=禁用）
@@ -277,6 +276,18 @@ void writeFlag(const char* path) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// printWifiHistory：打印 WiFi 历史列表（两处 show 共用）
+// ─────────────────────────────────────────────────────────────────────────────
+static void printWifiHistory() {
+    if (wifiNetworkCount == 0) {
+        Serial.println(F("  (empty)"));
+    } else {
+        for (int i = 0; i < wifiNetworkCount; i++)
+            Serial.printf("  [%d] %s\n", i, wifiNetworks[i].ssid);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // enterConfigMode：串口配置 CLI，保存后重启，永不正常返回
 // ─────────────────────────────────────────────────────────────────────────────
 static void printConfigHelp() {
@@ -339,24 +350,22 @@ void enterConfigMode() {
                 printConfigHelp();
 
             } else if (line == "show") {
-                Serial.println(F("[CFG] staged config:"));
-                Serial.printf("  wifi_ssid  : %s  (len=%u)\n", staged.wifi_ssid, strlen(staged.wifi_ssid));
-                Serial.printf("  wifi_pass  : %s  (len=%u)\n", strlen(staged.wifi_pass) ? staged.wifi_pass : "(not set)", strlen(staged.wifi_pass));
-                Serial.println(F("  [WiFi 历史]"));
-                if (wifiNetworkCount == 0) {
-                    Serial.println(F("    (empty)"));
-                } else {
-                    for (int i = 0; i < wifiNetworkCount; i++)
-                        Serial.printf("    [%d] %s\n", i, wifiNetworks[i].ssid);
-                }
-                Serial.printf("  mqtt_server: %s\n",  staged.mqtt_server);
-                Serial.printf("  mqtt_port  : %u\n",  staged.mqtt_port);
-                Serial.printf("  mqtt_user  : %s\n",  staged.mqtt_user);
-                Serial.printf("  mqtt_pass  : %s\n",  strlen(staged.mqtt_pass) ? staged.mqtt_pass : "(not set)");
-                Serial.printf("  mqtt_id    : %s\n",  staged.mqtt_id);
-                Serial.printf("  wol_mac    : %s\n",  staged.wol_mac);
-                Serial.printf("  ap_full_config: %s\n", staged.ap_full_config ? "true" : "false");
-                Serial.printf("  wifi_tx_power : %ddBm (0=platform default)\n", staged.wifi_tx_power);
+                Serial.println(F("------ staged config ------"));
+                Serial.println(F("[WiFi - pending]"));
+                Serial.printf("  ssid      : %s\n", strlen(staged.wifi_ssid) ? staged.wifi_ssid : "(not set)");
+                Serial.printf("  pass      : %s\n", strlen(staged.wifi_pass) ? "(set)"          : "(not set)");
+                Serial.println(F("[WiFi history]"));
+                printWifiHistory();
+                Serial.println(F("[MQTT]"));
+                Serial.printf("  server    : %s:%u\n", staged.mqtt_server, staged.mqtt_port);
+                Serial.printf("  user      : %s\n",    staged.mqtt_user);
+                Serial.printf("  pass      : %s\n",    strlen(staged.mqtt_pass) ? "(set)" : "(not set)");
+                Serial.printf("  id        : %s\n",    staged.mqtt_id);
+                Serial.println(F("[Device]"));
+                Serial.printf("  wol_mac   : %s\n",  staged.wol_mac);
+                Serial.printf("  tx_power  : %ddBm%s\n", staged.wifi_tx_power, staged.wifi_tx_power == 0 ? " (default)" : "");
+                Serial.printf("  ap_full   : %s\n",   staged.ap_full_config ? "true" : "false");
+                Serial.println(F("---------------------------"));
 
             } else if (line == "wifi list") {
                 if (wifiNetworkCount == 0) {
@@ -732,19 +741,25 @@ void checkRuntimeTriggers() {
                 delay(100);
                 ESP.restart();
             } else if (serialLineBuf == "show") {
-                Serial.println(F("------- 当前状态 ---------------"));
-                Serial.printf("  固件版本   : %s\n",  FW_VERSION);
-                Serial.printf("  SSID       : %s\n",  cfg.wifi_ssid);
-                Serial.printf("  IP         : %s\n",  WiFi.localIP().toString().c_str());
-                Serial.printf("  RSSI       : %ddBm\n", WiFi.RSSI());
-                Serial.printf("  MQTT 服务器: %s:%u\n", cfg.mqtt_server, cfg.mqtt_port);
-                Serial.printf("  Client ID  : %s\n",  cfg.mqtt_id);
-                Serial.printf("  WoL MAC    : %s\n",  cfg.wol_mac);
-                Serial.printf("  上报间隔   : %lus\n", statusIntervalMs / 1000);
-                Serial.printf("  重连次数   : %u\n",   mqttReconnectCount);
-                Serial.printf("  运行时长   : %lus\n", millis() / 1000);
-                Serial.printf("  可用堆     : %u bytes\n", ESP.getFreeHeap());
-                Serial.println(F("--------------------------------"));
+                Serial.println(F("-------- status --------"));
+                Serial.println(F("[System]"));
+                Serial.printf("  firmware  : %s\n",   FW_VERSION);
+                Serial.printf("  uptime    : %lus\n", millis() / 1000);
+                Serial.printf("  heap      : %u B\n", ESP.getFreeHeap());
+                Serial.println(F("[WiFi]"));
+                Serial.printf("  ssid      : %s\n",   cfg.wifi_ssid);
+                Serial.printf("  ip        : %s\n",   WiFi.localIP().toString().c_str());
+                Serial.printf("  rssi      : %ddBm\n", WiFi.RSSI());
+                Serial.println(F("[WiFi history]"));
+                printWifiHistory();
+                Serial.println(F("[MQTT]"));
+                Serial.printf("  server    : %s:%u\n", cfg.mqtt_server, cfg.mqtt_port);
+                Serial.printf("  id        : %s\n",    cfg.mqtt_id);
+                Serial.printf("  reconnects: %u\n",    mqttReconnectCount);
+                Serial.println(F("[Device]"));
+                Serial.printf("  wol_mac   : %s\n",  cfg.wol_mac);
+                Serial.printf("  interval  : %lus\n", statusIntervalMs / 1000);
+                Serial.println(F("------------------------"));
             }
             serialLineBuf = "";
         } else {
@@ -1170,43 +1185,27 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
         StaticJsonDocument<256> resp;
         resp["event"]      = "info";
         resp["version"]    = FW_VERSION;
-        resp["mac"]        = cfg.wol_mac;
         resp["ssid"]       = cfg.wifi_ssid;
+        resp["rssi"]       = WiFi.RSSI();
+        resp["wol_mac"]    = cfg.wol_mac;
         resp["reconnects"] = mqttReconnectCount;
-        pubJson(resp);
+        pubJson(resp);  // appends uptime / heap / ip
 
-    // ── show ──
-    } else if (strcmp(cmd, "show") == 0) {
-        StaticJsonDocument<512> resp;
-        resp["event"]           = "show";
-        resp["version"]         = FW_VERSION;
+    // ── config ──
+    } else if (strcmp(cmd, "config") == 0) {
+        StaticJsonDocument<640> resp;
+        resp["event"]           = "config";
         resp["wifi_ssid"]       = cfg.wifi_ssid;
-        resp["wol_mac"]         = cfg.wol_mac;
+        JsonArray nets = resp.createNestedArray("wifi_networks");
+        for (int i = 0; i < wifiNetworkCount; i++) nets.add(wifiNetworks[i].ssid);
         resp["mqtt_server"]     = cfg.mqtt_server;
         resp["mqtt_port"]       = cfg.mqtt_port;
         resp["mqtt_user"]       = cfg.mqtt_user;
         resp["mqtt_id"]         = cfg.mqtt_id;
+        resp["wol_mac"]         = cfg.wol_mac;
         resp["status_interval"] = statusIntervalMs / 1000;
         resp["wifi_tx_power"]   = cfg.wifi_tx_power;
-        resp["ip"]              = WiFi.localIP().toString();
-        resp["rssi"]            = WiFi.RSSI();
-        resp["uptime"]          = millis() / 1000;
-        resp["heap"]            = ESP.getFreeHeap();
-        resp["reconnects"]      = mqttReconnectCount;
-        pubJson(resp);
-
-    // ── config ──
-    } else if (strcmp(cmd, "config") == 0) {
-        StaticJsonDocument<384> resp;
-        resp["event"]            = "config";
-        resp["wifi_ssid"]        = cfg.wifi_ssid;
-        resp["mqtt_server"]      = cfg.mqtt_server;
-        resp["mqtt_port"]        = cfg.mqtt_port;
-        resp["mqtt_user"]        = cfg.mqtt_user;
-        resp["mqtt_id"]          = cfg.mqtt_id;
-        resp["wol_mac"]          = cfg.wol_mac;
-        resp["status_interval"]  = statusIntervalMs / 1000;
-        pubJson(resp);
+        pubJson(resp);  // appends uptime / heap / ip
 
     // ── set ──
     } else if (strcmp(cmd, "set") == 0) {

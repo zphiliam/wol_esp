@@ -37,15 +37,19 @@
 {"cmd":"reboot"}
 ```
 
-### 查询设备信息
+### 查询设备运行状态
 ```json
 {"cmd":"info"}
 ```
 
-### 查询所有配置
+响应包含：version、当前连接 ssid/rssi、wol_mac、MQTT 重连次数，以及公共字段 uptime/heap/ip。
+
+### 查询完整配置
 ```json
 {"cmd":"config"}
 ```
+
+响应包含：所有已保存配置字段（含 WiFi 历史列表）及公共字段。
 
 ### 控制 LED
 
@@ -203,9 +207,10 @@
 ```json
 {
   "event": "info",
-  "version": "2.0.0-20260328",
-  "mac": "00E269666C6E",
-  "ssid": "CMCC-QSrV",
+  "version": "2.4.0-20260408",
+  "ssid": "HomeWifi",
+  "rssi": -65,
+  "wol_mac": "00E269666C6E",
   "reconnects": 0,
   "uptime": 123,
   "heap": 44000,
@@ -219,20 +224,23 @@
 ```json
 {
   "event": "config",
-  "wifi_ssid": "CMCC-QSrV",
-  "mqtt_server": "p1217771.ala.asia-southeast1.emqxsl.com",
+  "wifi_ssid": "HomeWifi",
+  "wifi_networks": ["HomeWifi", "OfficeWifi"],
+  "mqtt_server": "broker.example.com",
   "mqtt_port": 8883,
-  "mqtt_user": "esp8266",
+  "mqtt_user": "esp_user",
   "mqtt_id": "esp_12f_01",
   "wol_mac": "00E269666C6E",
   "status_interval": 300,
+  "wifi_tx_power": 15,
   "uptime": 123,
   "heap": 44000,
   "ip": "192.168.1.100"
 }
 ```
 
-> `mqtt_pass` 出于安全考虑不予返回
+> - `mqtt_pass` 出于安全考虑不予返回
+> - `wifi_networks`：历史 WiFi 列表（仅 SSID，不含密码），按最近连接顺序排列
 
 ### OTA 事件
 
