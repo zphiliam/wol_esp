@@ -42,7 +42,7 @@ jobs:
 
       - name: Add board index
         run: |
-          arduino-cli config init
+          arduino-cli config init --overwrite
           arduino-cli config add board_manager.additional_urls "${{ matrix.core_url }}"
 
       - name: Install core

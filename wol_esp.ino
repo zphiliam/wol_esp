@@ -607,6 +607,7 @@ static void handleAPConfig() {
 }
 
 static void handleAPScan() {
+    // scanNetworks() 默认已按 RSSI 降序排列（信号最强在前）
     int n = WiFi.scanNetworks();
     String json = "[";
     for (int i = 0; i < n; i++) {
@@ -614,7 +615,8 @@ static void handleAPScan() {
         String ssid = WiFi.SSID(i);
         ssid.replace("\\", "\\\\");
         ssid.replace("\"", "\\\"");
-        json += "\"" + ssid + "\"";
+        int rssi = WiFi.RSSI(i);
+        json += "{\"ssid\":\"" + ssid + "\",\"rssi\":" + String(rssi) + "}";
     }
     json += "]";
     WiFi.scanDelete();
