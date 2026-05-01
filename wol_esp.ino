@@ -30,6 +30,8 @@
  *   {"cmd":"led","val":"blink","times":5,"interval":500}
  *   {"cmd":"set","key":"status_interval","val":30}  设置状态上报间隔（秒，0=禁用）
  *   {"cmd":"ota","url":"https://..."}          OTA 升级（自动跟踪重定向，支持 GitHub release URL）
+ *   {"cmd":"speedtest"}                         网络测速（HTTP 下载丢弃，默认 15s，MQTT 保持连接）
+ *   {"cmd":"speedtest","url":"http://...","max_seconds":10}
  */
 
 #if defined(ESP8266)
@@ -1118,6 +1120,137 @@ void doOTA(const char* urlParam) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// doSpeedtest：HTTP 下载测速，MQTT 全程保持连接
+//   流程：heap 检查 → 发布 speedtest_start → HTTP GET（仅 HTTP，拒绝 HTTPS）
+//         → 丢弃数据计字节，超时或 EOF 停止 → 发布 speedtest_result / speedtest_fail
+//   计时从收到首字节开始，排除 TCP 握手和 HTTP 头部解析耗时
+//   读取使用 512B 栈 buffer，不在 heap 分配接收缓冲区
+// ─────────────────────────────────────────────────────────────────────────────
+void doSpeedtest(const char* urlParam, int maxSeconds) {
+    maxSeconds = constrain(maxSeconds, 5, 60);
+
+#ifdef ESP8266
+    if ((int)ESP.getMaxFreeBlockSize() < SPEEDTEST_MIN_HEAP) {
+#else
+    if ((int)ESP.getMaxAllocHeap() < SPEEDTEST_MIN_HEAP) {
+#endif
+        pubEvent("error:heap_low");
+        return;
+    }
+
+    char url[256];
+    strlcpy(url, urlParam, sizeof(url));
+
+    Serial.printf("[SPD] start: %s  max=%ds\n", url, maxSeconds);
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "{\"event\":\"speedtest_start\",\"max_seconds\":%d,\"uptime\":%lu,\"heap\":%u}",
+            maxSeconds, millis() / 1000, ESP.getFreeHeap());
+        mqtt.publish(TOPIC_PUB, buf);
+    }
+
+    bool     success    = false;
+    String   failReason;
+    uint32_t totalBytes = 0;
+    uint32_t elapsedMs  = 0;
+
+    {
+        String currentUrl = String(url);
+        for (int hop = 0; hop < 5; hop++) {
+            if (currentUrl.startsWith("https://")) {
+                failReason = F("https not supported");
+                break;
+            }
+
+            WiFiClient c;
+            HTTPClient http;
+            http.setTimeout(10000);
+            http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+
+            if (!http.begin(c, currentUrl)) {
+                failReason = F("http.begin failed");
+                break;
+            }
+
+            int code = http.GET();
+            Serial.printf("[SPD] hop %d HTTP %d\n", hop, code);
+
+            if ((code / 100) == 3) {
+                String loc = http.getLocation();
+                http.end();
+                if (loc.length() > 0) {
+                    Serial.printf("[SPD] → %s\n", loc.c_str());
+                    currentUrl = loc;
+                    continue;
+                }
+                failReason = F("redirect: no Location");
+                break;
+            }
+
+            if (code == HTTP_CODE_OK) {
+                WiFiClient* stream = http.getStreamPtr();
+                stream->setTimeout(5000);
+
+                uint8_t  buf[512];
+                uint32_t startMs  = millis();
+                uint32_t deadline = startMs + (uint32_t)maxSeconds * 1000;
+
+                while (millis() < deadline) {
+                    if (stream->available()) {
+                        int n = stream->read(buf, sizeof(buf));
+                        if (n > 0) totalBytes += (uint32_t)n;
+                        else break;
+                    } else {
+                        if (!stream->connected()) break;
+                        yield();
+                    }
+                }
+
+                elapsedMs = millis() - startMs;
+                if (totalBytes > 0 && elapsedMs > 0) {
+                    success = true;
+                } else {
+                    failReason = F("no data received");
+                }
+                Serial.printf("[SPD] %u bytes in %u ms\n", totalBytes, elapsedMs);
+            } else if (code < 0) {
+                failReason = String(F("HTTP error: ")) + HTTPClient::errorToString(code);
+                Serial.printf("[SPD] error: %s\n", failReason.c_str());
+            } else {
+                failReason = String(F("HTTP ")) + code;
+            }
+
+            http.end();
+            break;
+        }
+    }
+
+    if (success) {
+        uint32_t kbps = totalBytes * 8 / elapsedMs;
+        StaticJsonDocument<192> doc;
+        doc["event"]      = "speedtest_result";
+        doc["bytes"]      = totalBytes;
+        doc["elapsed_ms"] = elapsedMs;
+        doc["kbps"]       = kbps;
+        doc["uptime"]     = millis() / 1000;
+        doc["heap"]       = ESP.getFreeHeap();
+        char buf[192];
+        serializeJson(doc, buf, sizeof(buf));
+        mqtt.publish(TOPIC_PUB, buf);
+    } else {
+        StaticJsonDocument<192> doc;
+        doc["event"]  = "speedtest_fail";
+        doc["reason"] = failReason;
+        doc["uptime"] = millis() / 1000;
+        doc["heap"]   = ESP.getFreeHeap();
+        char buf[192];
+        serializeJson(doc, buf, sizeof(buf));
+        mqtt.publish(TOPIC_PUB, buf);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // doSetMqtt：在线更新 MQTT 连接配置
 //   流程：断开当前 MQTT → 临时客户端测试新连接 → 成功则保存并重启，失败则恢复原连接
 //   注意：测试客户端与主客户端顺序使用，避免双 TLS 上下文同时占用内存（ESP8266 关键）
@@ -1350,6 +1483,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
         } else {
             doOTA(url);   // 内部处理所有结果上报，成功时直接重启
         }
+
+    // ── speedtest ──
+    } else if (strcmp(cmd, "speedtest") == 0) {
+        const char* url = doc["url"] | SPEEDTEST_DEFAULT_URL;
+        int maxSec      = doc["max_seconds"] | SPEEDTEST_DEFAULT_SECS;
+        doSpeedtest(url, maxSec);
 
     // ── 未知指令 ──
     } else {

@@ -26,5 +26,10 @@
 #define STATUS_INTERVAL_MIN      10     // 秒，最短间隔
 #define STATUS_INTERVAL_MAX      3600   // 秒，最长间隔（1 小时）
 
+// ── 测速 ─────────────────────────────────────────────────────────────────────
+#define SPEEDTEST_DEFAULT_URL   "http://mirrors.tuna.tsinghua.edu.cn/speedtest/100mb.bin"
+#define SPEEDTEST_DEFAULT_SECS  15     // 秒，默认测速时长上限
+#define SPEEDTEST_MIN_HEAP      6144   // 触发测速前要求的最大连续 heap（字节）
+
 // ── 版本 ──────────────────────────────────────────────────────────────────────
-#define FW_VERSION  "2.4.5-20260501"
+#define FW_VERSION  "2.4.6-20260501"

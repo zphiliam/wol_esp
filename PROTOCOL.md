@@ -105,6 +105,24 @@
 
 > **注意**：ESP32-C3 需使用支持 OTA 的分区方案（如 `Minimal SPIFFS`），初次切换须手动烧录一次。
 
+### 网络测速
+
+```json
+{"cmd":"speedtest"}
+```
+
+自定义测速 URL 和时长：
+```json
+{"cmd":"speedtest","url":"http://mirrors.tuna.tsinghua.edu.cn/speedtest/100mb.bin","max_seconds":10}
+```
+
+- `url`：可选，默认为清华镜像站 100MB 测速文件（**仅支持 HTTP，不支持 HTTPS**）
+- `max_seconds`：可选，测速时长上限，范围 5～60，默认 15 秒；达到时限或文件下载完毕即停止
+- 下载内容直接丢弃，不写入 Flash
+- MQTT 连接全程保持，测速结束后立即上报结果
+- 计时从收到首字节开始，不含 TCP 握手和 HTTP 头部解析耗时
+- 执行前检查 heap 连续可用块，不足 6144 字节时拒绝并返回 `error:heap_low`
+
 ---
 
 ## 上行事件
@@ -242,6 +260,42 @@
 > - `mqtt_pass` 出于安全考虑不予返回
 > - `wifi_networks`：历史 WiFi 列表（仅 SSID，不含密码），按最近连接顺序排列
 
+### 测速事件
+
+测速开始（HTTP 连接建立前发出）：
+```json
+{
+  "event": "speedtest_start",
+  "max_seconds": 15,
+  "uptime": 3600,
+  "heap": 13000
+}
+```
+
+测速成功：
+```json
+{
+  "event": "speedtest_result",
+  "bytes": 2621440,
+  "elapsed_ms": 10023,
+  "kbps": 2092,
+  "uptime": 3615,
+  "heap": 11000
+}
+```
+
+> `kbps`：下载速率（千比特/秒），`bytes × 8 / elapsed_ms`
+
+测速失败：
+```json
+{
+  "event": "speedtest_fail",
+  "reason": "http.begin failed",
+  "uptime": 3615,
+  "heap": 12000
+}
+```
+
 ### OTA 事件
 
 升级开始（MQTT 断开前发出）：
@@ -320,5 +374,6 @@
 | `error:unknown_led_val` | 未知 LED val 值 |
 | `error:invalid_mac` | wol 指令中 `mac` 参数格式非法 |
 | `error:ota_url_missing` | ota 指令缺少 `url` 字段 |
+| `error:heap_low` | speedtest 执行时 heap 连续可用块不足 6144 字节 |
 | `error:set_mqtt_no_change` | set_mqtt 指令所有字段均与当前配置相同 |
 | `error:mqtt_connect_failed` | set_mqtt 指令测试连接失败，原配置保留（附 `rc` 字段）|
