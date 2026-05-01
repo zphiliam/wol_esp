@@ -1119,8 +1119,9 @@ void doOTA(const char* urlParam) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // doSetMqtt：在线更新 MQTT 连接配置
-//   流程：断开当前 MQTT → 临时客户端测试新连接 → 成功则保存并切换，失败则恢复原连接
+//   流程：断开当前 MQTT → 临时客户端测试新连接 → 成功则保存并重启，失败则恢复原连接
 //   注意：测试客户端与主客户端顺序使用，避免双 TLS 上下文同时占用内存（ESP8266 关键）
+//   重启原因：保证 TLS 状态干净、mqttEverConnected 复位、新 broker 收到 online 事件
 // ─────────────────────────────────────────────────────────────────────────────
 void doSetMqtt(const char* newServer, uint16_t newPort,
                const char* newUser,   const char* newPass, const char* newId) {
@@ -1162,37 +1163,32 @@ void doSetMqtt(const char* newServer, uint16_t newPort,
     }
 
     if (ok) {
-        // 4a. 写入新配置并持久化
+        // 4a. 写入新配置、持久化、重启
+        // 主客户端已在步骤 2 断开，无法在此 publish；重启后设备用新配置连接新 broker
+        // 并发出 online 事件，作为切换成功的隐式确认
         strlcpy(cfg.mqtt_server, testServer, sizeof(cfg.mqtt_server));
         cfg.mqtt_port = testPort;
         strlcpy(cfg.mqtt_user, testUser, sizeof(cfg.mqtt_user));
         strlcpy(cfg.mqtt_pass, testPass, sizeof(cfg.mqtt_pass));
         strlcpy(cfg.mqtt_id,   testId,   sizeof(cfg.mqtt_id));
-
-        // 更新订阅/发布主题（mqtt_id 可能已变）
-        snprintf(TOPIC_SUB, sizeof(TOPIC_SUB), "home/wol/%s/cmd",   cfg.mqtt_id);
-        snprintf(TOPIC_PUB, sizeof(TOPIC_PUB), "home/wol/%s/event", cfg.mqtt_id);
-
         saveConfig();
-        Serial.println(F("[SET_MQTT] config saved, reconnecting to new broker"));
-
-        mqtt.setServer(cfg.mqtt_server, cfg.mqtt_port);
-        connectMQTT();
-        pubEvent("ok:mqtt_updated");
+        Serial.println(F("[SET_MQTT] config saved, rebooting"));
+        ESP.restart();
 
     } else {
-        // 4b. cfg 未变，直接用原配置重连
-        Serial.println(F("[SET_MQTT] reverting to original broker"));
+        // 4b. cfg 未变，重连原 broker 发出错误事件后重启
+        Serial.printf("[SET_MQTT] test FAILED rc=%d, rebooting\n", testRc);
         mqtt.setServer(cfg.mqtt_server, cfg.mqtt_port);
-
-        // cfg 未变，connectMQTT 会用 cfg 里的凭据
-        connectMQTT();
-
-        char buf[128];
-        snprintf(buf, sizeof(buf),
-            "{\"event\":\"error:mqtt_connect_failed\",\"rc\":%d,\"uptime\":%lu,\"heap\":%u}",
-            testRc, millis() / 1000, ESP.getFreeHeap());
-        mqtt.publish(TOPIC_PUB, buf);
+        if (mqtt.connect(cfg.mqtt_id, cfg.mqtt_user, cfg.mqtt_pass,
+                TOPIC_PUB, 0, true, "{\"event\":\"offline\"}")) {
+            char buf[128];
+            snprintf(buf, sizeof(buf),
+                "{\"event\":\"error:mqtt_connect_failed\",\"rc\":%d,\"uptime\":%lu,\"heap\":%u}",
+                testRc, millis() / 1000, ESP.getFreeHeap());
+            mqtt.publish(TOPIC_PUB, buf);
+            delay(200);
+        }
+        ESP.restart();
     }
 }
 
