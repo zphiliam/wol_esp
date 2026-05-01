@@ -1270,6 +1270,12 @@ void doSetMqtt(const char* newServer, uint16_t newPort,
 
     // 2. 断开当前 MQTT（释放 TLS 资源）
     // 失败时直接用 cfg.* 回退（cfg 在失败分支中未被修改）
+    // 先清除旧 broker 上的 retained 消息（空 payload + retain=true）
+    // mqtt.disconnect() 发送正常 DISCONNECT 包，不会触发 LWT，retained online 会残留
+    if (mqtt.connected()) {
+        mqtt.publish(TOPIC_PUB, (const uint8_t*)"", 0, true);
+        delay(100);
+    }
     mqtt.disconnect();
     delay(100);
 
