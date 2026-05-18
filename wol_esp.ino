@@ -185,6 +185,21 @@ static void genMqttId(char* buf, size_t len) {
     snprintf(buf, len, "wol-%012llx", (unsigned long long)ESP.getEfuseMac());
 }
 
+// 打印设备身份（mqtt_id + BLE PSK）：人读框 + 机读单行 [ID]。
+// 供串口 CLI、BLE 配网模式、正常运行三处的 id 命令共用；机读行便于采集工具解析。
+static void printDeviceId() {
+    Serial.println(F("------ device identity ------"));
+    Serial.printf("  mqtt_id : %s\n", cfg.mqtt_id);
+    Serial.print(F("  ble_psk : "));
+    for (int i = 0; i < BLE_PSK_LEN; i++) Serial.printf("%02x", blePsk[i]);
+    Serial.println();
+    Serial.println(F("-----------------------------"));
+    // 机读单行：[ID] mqtt_id=... psk=...
+    Serial.printf("[ID] mqtt_id=%s psk=", cfg.mqtt_id);
+    for (int i = 0; i < BLE_PSK_LEN; i++) Serial.printf("%02x", blePsk[i]);
+    Serial.println();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // LRU WiFi 历史缓存：内部工具 + 公共接口
 // 持久化到 /wifi_networks.json，格式不变（兼容旧固件）
@@ -424,13 +439,7 @@ void enterConfigMode() {
                 Serial.println(F("---------------------------"));
 
             } else if (line == "id") {
-                // 读取设备身份：mqtt_id（芯片派生）与 BLE PSK（用于贴二维码 / 服务端配置）
-                Serial.println(F("------ device identity ------"));
-                Serial.printf("  mqtt_id : %s\n", cfg.mqtt_id);
-                Serial.print(F("  ble_psk : "));
-                for (int i = 0; i < BLE_PSK_LEN; i++) Serial.printf("%02x", blePsk[i]);
-                Serial.println();
-                Serial.println(F("-----------------------------"));
+                printDeviceId();
 
             } else if (line == "wifi list") {
                 if (wifiCount == 0) {
@@ -956,6 +965,8 @@ void enterBLEProvMode() {
                     Serial.println(F("[BLE] serial → rebooting..."));
                     delay(100);
                     ESP.restart();
+                } else if (serialLineBuf == "id") {
+                    printDeviceId();
                 }
                 serialLineBuf = "";
             } else if (serialLineBuf.length() < 128) {
@@ -1019,6 +1030,7 @@ void checkBLEProvFlag() {
 //   串口输入 "ble"     → 写 /bleprov，重启进入 BLE 配网模式
 //   串口输入 "reboot"  → 直接重启
 //   串口输入 "show"    → 打印当前运行状态（不重启）
+//   串口输入 "id"      → 打印设备 mqtt_id 与 BLE PSK（不重启）
 //   按键按住 3s 松手   → 写 /bleprov，重启进入 BLE 配网（配置保留，LED 双闪提示）
 //   按键按住 10s      → 工厂重置（清空配置）后进入 BLE 配网（LED 五闪确认）
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1063,6 +1075,8 @@ void checkRuntimeTriggers() {
                 Serial.printf("  wol_mac   : %s\n",  cfg.wol_mac);
                 Serial.printf("  interval  : %lus\n", statusIntervalMs / 1000);
                 Serial.println(F("------------------------"));
+            } else if (serialLineBuf == "id") {
+                printDeviceId();
             }
             serialLineBuf = "";
         } else {
