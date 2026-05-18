@@ -1,4 +1,4 @@
-# WoL ESP-12F — MQTT 协议文档
+# WoL ESP32-C3 — MQTT 协议文档
 
 ## 主题
 

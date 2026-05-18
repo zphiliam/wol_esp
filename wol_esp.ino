@@ -1,8 +1,8 @@
 /**
- * WoL ESP8266/ESP32-C3 — C++ Arduino 版  v2.2
+ * WoL ESP32-C3 — C++ Arduino 版  v2.2
  *
  * 功能：通过 MQTT 远程唤醒局域网内电脑
- * 硬件：ESP-12F（LED GPIO2）/ ESP32-C3 SuperMini（LED GPIO8），均 active LOW
+ * 硬件：ESP32-C3 SuperMini（LED GPIO8，active LOW）
  *
  * 依赖库（Arduino IDE 库管理器安装）：
  *   - PubSubClient  by Nick O'Leary
@@ -34,11 +34,7 @@
  *   {"cmd":"speedtest","url":"http://...","max_seconds":10}
  */
 
-#if defined(ESP8266)
-  #include <ESP8266WiFi.h>
-#else
-  #include <WiFi.h>
-#endif
+#include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <WiFiUdp.h>
@@ -47,32 +43,16 @@
 #include "config.h"
 
 // ── OTA ──────────────────────────────────────────────────────────────────────
-#ifdef ESP8266
-  #include <ESP8266HTTPClient.h>
-#else
-  #include <HTTPClient.h>
-  #include <Update.h>
-#endif
+#include <HTTPClient.h>
+#include <Update.h>
 
 // ── WebServer + DNS（配置 AP 模式 / Captive Portal） ─────────────────────────
-#ifdef ESP8266
-  #include <ESP8266WebServer.h>
-  #define WolWebServer ESP8266WebServer
-#else
-  #include <WebServer.h>
-  #define WolWebServer WebServer
-#endif
+#include <WebServer.h>
 #include <DNSServer.h>
-#ifndef ESP8266
-  #include "esp_wifi.h"   // esp_wifi_set_ps()
-#endif
+#include "esp_wifi.h"   // esp_wifi_set_ps()
 
 // ── 硬件 ──────────────────────────────────────────────────────────────────────
-#if defined(ESP8266)
-const uint8_t LED_PIN = 2;   // ESP-12F，active LOW
-#else
 const uint8_t LED_PIN = 8;   // ESP32-C3 SuperMini，active LOW
-#endif
 
 // ── 运行时配置结构（从 LittleFS /config.json 加载） ────────────────────────────
 struct DevConfig {
@@ -113,7 +93,7 @@ char TOPIC_PUB[64];
 WiFiClientSecure wifiClient;
 PubSubClient     mqtt(wifiClient);
 WiFiUDP          udp;
-WolWebServer     apServer(80);
+WebServer        apServer(80);
 DNSServer        dnsServer;
 
 // ── 运行时可修改的配置 ────────────────────────────────────────────────────────
@@ -184,12 +164,8 @@ bool loadConfig() {
     strlcpy(cfg.wol_mac,     doc["wol_mac"]      | "", sizeof(cfg.wol_mac));
     cfg.wifi_ever_ok   = doc["wifi_ever_ok"]   | false;
     cfg.ap_full_config = doc["ap_full_config"] | false;
-    // 默认值：ESP32-C3 SuperMini 天线设计缺陷+LDO电流不足，15dBm 最稳定（ESP3D 实测推荐）；ESP8266 无此问题用满功率
-#ifdef ESP8266
-    cfg.wifi_tx_power  = doc["wifi_tx_power"]  | 20;
-#else
+    // 默认值：ESP32-C3 SuperMini 天线设计缺陷+LDO电流不足，15dBm 最稳定（ESP3D 实测推荐）
     cfg.wifi_tx_power  = doc["wifi_tx_power"]  | 15;
-#endif
 
     // 必填项校验（wifi_ssid 已迁移至 wifi_networks.json，此处不再要求）
     return strlen(cfg.mqtt_server) > 0
@@ -397,8 +373,7 @@ void enterConfigMode() {
     bool ledOn = false;
 
     while (true) {
-        // ESP8266 软件看门狗（SWD）约 3s 超时，此循环永不返回，必须手动喂狗。
-        // yield() 在 ESP8266 上触发后台任务调度并重置 SWD；ESP32-C3 上为空操作，无副作用。
+        // 此循环永不返回，yield() 让出 CPU 给后台任务（WiFi/系统），避免看门狗复位。
         yield();
 
         // LED 100ms 快闪提示配置模式
@@ -696,11 +671,7 @@ static void handleAPSave() {
 void enterSoftAPMode() {
     // 计算 AP SSID（chip ID 末 4 位十六进制，两平台均可）
     char apSSID[20];
-#ifdef ESP8266
-    snprintf(apSSID, sizeof(apSSID), "WoL-Setup-%04X", (uint16_t)(ESP.getChipId() & 0xFFFF));
-#else
     snprintf(apSSID, sizeof(apSSID), "WoL-Setup-%04X", (uint16_t)(ESP.getEfuseMac() & 0xFFFF));
-#endif
 
     // ESP32-C3：彻底停掉 STA，关闭省电模式（否则 beacon 不广播）
     // WIFI_AP_STA：保留 STA 射频，使 scanNetworks() 可在 AP 运行期间使用
@@ -708,19 +679,13 @@ void enterSoftAPMode() {
     WiFi.softAPdisconnect(true);
     WiFi.mode(WIFI_AP_STA);
     delay(200);
-#ifndef ESP8266
     esp_wifi_set_ps(WIFI_PS_NONE);   // 关闭省电，确保 beacon 持续广播
-#endif
     bool apOk = WiFi.softAP(apSSID, nullptr, 6);  // 指定 ch6，避免信道扫描遗漏
-#ifndef ESP8266
     {
         int8_t txp = cfg.wifi_tx_power;
-#ifdef CONFIG_IDF_TARGET_ESP32C3
         if (txp == 0) txp = 15;  // ESP32-C3 天线缺陷+LDO不足，默认限制 15dBm
-#endif
         if (txp > 0) esp_wifi_set_max_tx_power((int8_t)(txp * 4));
     }
-#endif
     Serial.printf("[AP] softAP() = %s\n", apOk ? "OK" : "FAILED");
     Serial.printf("\n[AP] SoftAP started — SSID: %s  IP: 192.168.4.1\n", apSSID);
     Serial.println(F("[AP] Connect to the AP, then open http://192.168.4.1"));
@@ -1001,7 +966,7 @@ void doOTA(const char* urlParam) {
     }
     delay(300);  // 等待 MQTT 发送完成
 
-    // 2. 断开 MQTT，释放 TLS 上下文内存（ESP8266 关键步骤）
+    // 2. 断开 MQTT，释放 TLS 上下文内存
     mqtt.disconnect();
     delay(100);
 
@@ -1009,8 +974,7 @@ void doOTA(const char* urlParam) {
     String failReason;
 
     // ── HTTPClient + Update，手动逐跳跟踪重定向，每跳独立新客户端 ──────────────
-    // 不使用 ESPhttpUpdate / setFollowRedirects：
-    //   - ESPhttpUpdate 发送 x-ESP8266-* 请求头，部分代理服务会据此屏蔽
+    // 不使用 setFollowRedirects：
     //   - HTTPC_FORCE_FOLLOW_REDIRECTS 在跨主机跳转时复用同一 TLS 对象，导致握手失败
     // 统一实现：每跳新建 WiFiClient/WiFiClientSecure，确保 TLS 连接独立
     {
@@ -1056,15 +1020,9 @@ void doOTA(const char* urlParam) {
             if (code == HTTP_CODE_OK) {
                 int totalSize = http.getSize();
                 Serial.printf("[OTA] size: %d bytes\n", totalSize);
-#ifdef ESP8266
-                size_t updateSize = totalSize > 0 ? (size_t)totalSize : (size_t)-1;
-                #define OTA_ERROR_STRING Update.getErrorString()
-#else
                 int updateSize = totalSize > 0 ? totalSize : UPDATE_SIZE_UNKNOWN;
-                #define OTA_ERROR_STRING Update.errorString()
-#endif
                 if (!Update.begin(updateSize)) {
-                    failReason = OTA_ERROR_STRING;
+                    failReason = Update.errorString();
                     Serial.printf("[OTA] Update.begin failed: %s\n", failReason.c_str());
                 } else {
                     Update.onProgress([](size_t done, size_t total) {
@@ -1078,11 +1036,10 @@ void doOTA(const char* urlParam) {
                     if (Update.end(true) && Update.isFinished()) {
                         success = true;
                     } else {
-                        failReason = OTA_ERROR_STRING;
+                        failReason = Update.errorString();
                         Serial.printf("[OTA] Update.end failed: %s\n", failReason.c_str());
                     }
                 }
-                #undef OTA_ERROR_STRING
             } else if (code < 0) {
                 failReason = String(F("HTTP error: ")) + HTTPClient::errorToString(code);
                 Serial.printf("[OTA] connection error: %s\n", failReason.c_str());
@@ -1129,11 +1086,7 @@ void doOTA(const char* urlParam) {
 void doSpeedtest(const char* urlParam, int maxSeconds) {
     maxSeconds = constrain(maxSeconds, 5, 60);
 
-#ifdef ESP8266
-    if ((int)ESP.getMaxFreeBlockSize() < SPEEDTEST_MIN_HEAP) {
-#else
     if ((int)ESP.getMaxAllocHeap() < SPEEDTEST_MIN_HEAP) {
-#endif
         pubEvent("error:heap_low");
         return;
     }
@@ -1253,7 +1206,7 @@ void doSpeedtest(const char* urlParam, int maxSeconds) {
 // ─────────────────────────────────────────────────────────────────────────────
 // doSetMqtt：在线更新 MQTT 连接配置
 //   流程：断开当前 MQTT → 临时客户端测试新连接 → 成功则保存并重启，失败则恢复原连接
-//   注意：测试客户端与主客户端顺序使用，避免双 TLS 上下文同时占用内存（ESP8266 关键）
+//   注意：测试客户端与主客户端顺序使用，避免双 TLS 上下文同时占用内存
 //   重启原因：保证 TLS 状态干净、mqttEverConnected 复位、新 broker 收到 online 事件
 // ─────────────────────────────────────────────────────────────────────────────
 void doSetMqtt(const char* newServer, uint16_t newPort,
@@ -1521,7 +1474,7 @@ static const char* wifiStatusName(int s) {
 }
 
 // connectWiFiMulti：轮试历史 WiFi 列表，连上后把成功的网络移至列表头部。
-// ESP32-C3 先扫描，优先尝试当前可见网络；ESP8266 按列表顺序盲试。
+// 连接前先扫描,优先尝试当前可见网络。
 // 全部失败时：首次连接进配置模式，曾经连上过则重启（SDK 下次启动自动重试）。
 void connectWiFiMulti() {
     if (wifiCount == 0) {
@@ -1531,18 +1484,11 @@ void connectWiFiMulti() {
 
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(false);  // 轮试期间手动管理，连上后再开启
-#ifdef ESP8266
-    if (cfg.wifi_tx_power > 0)
-        WiFi.setOutputPower((float)cfg.wifi_tx_power);
-#else
     {
         int8_t txp = cfg.wifi_tx_power;
-#ifdef CONFIG_IDF_TARGET_ESP32C3
         if (txp == 0) txp = 15;
-#endif
         if (txp > 0) esp_wifi_set_max_tx_power((int8_t)(txp * 4));
     }
-#endif
     Serial.printf("[WiFi] TX power = %ddBm%s\n", cfg.wifi_tx_power,
         (cfg.wifi_tx_power == 0) ? " (platform default)" : "");
 
@@ -1550,8 +1496,7 @@ void connectWiFiMulti() {
     uint8_t order[WIFI_MAX_NETWORKS];
     uint8_t orderCount = 0;
 
-#if !defined(ESP8266)
-    // ESP32-C3：先扫描，可见网络排前面（隐藏网络仍在列表末尾兜底）
+    // 先扫描，可见网络排前面（隐藏网络仍在列表末尾兜底）
     Serial.println(F("[WiFi] scanning..."));
     int scanN = WiFi.scanNetworks();
     for (uint8_t i = 0; i < wifiCount; i++) {
@@ -1568,10 +1513,6 @@ void connectWiFiMulti() {
         if (!already) order[orderCount++] = i;
     }
     Serial.printf("[WiFi] %d visible, %d total candidate(s)\n", visibleCount, wifiCount);
-#else
-    // ESP8266：按列表顺序盲试
-    for (uint8_t i = 0; i < wifiCount; i++) order[orderCount++] = i;
-#endif
 
     // ── 逐个尝试 ─────────────────────────────────────────────────────────────
     unsigned long startMs = millis();
@@ -1716,11 +1657,7 @@ void connectMQTT() {
 void setup() {
     Serial.begin(115200);
     delay(200);
-#if defined(ESP8266)
-    Serial.println(F("\n\n====== WoL ESP-12F boot ======"));
-#else
     Serial.println(F("\n\n====== WoL ESP32-C3 boot ======"));
-#endif
     Serial.println(F("Firmware: " FW_VERSION));
 
     pinMode(LED_PIN, OUTPUT);
@@ -1728,15 +1665,7 @@ void setup() {
     pinMode(CFG_RESET_PIN, INPUT_PULLUP);
 
     // ── 1. 挂载文件系统 ──
-#if defined(ESP8266)
-    if (!LittleFS.begin()) {
-        Serial.println(F("[FS] format..."));
-        LittleFS.format();
-        LittleFS.begin();
-    }
-#else
     LittleFS.begin(true);  // formatOnFail
-#endif
     Serial.println(F("[FS] mounted"));
 
     // ── 2. 加载配置（需先于所有模式检测，确保 cfg 已填充） ──
@@ -1790,8 +1719,7 @@ void setup() {
     // NTP 时间同步（UTC+8），异步不阻塞
     // 暂时禁用：代码中所有时间戳均使用 millis()/1000（uptime），无需真实时钟；
     // TLS 使用 setInsecure() 跳过证书验证，也不依赖系统时间。
-    // 在 ESP8266 上 configTime() 会分配 SNTP 内部结构体，约占用 1~2KB 堆，
-    // 当前不需要，待引入绝对时间戳功能时再启用。
+    // 待引入绝对时间戳功能时再启用。
     // configTime(8 * 3600, 0, "ntp1.aliyun.com", "ntp2.aliyun.com", "pool.ntp.org");
 
     // ── 9. 连接 MQTT ──
