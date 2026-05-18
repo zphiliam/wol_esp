@@ -33,8 +33,9 @@
   .panel h2 { font-size:13px; margin:0 0 10px; color:var(--muted);
               text-transform:uppercase; letter-spacing:.05em; }
   label { display:block; font-size:12px; color:var(--muted); margin:8px 0 3px; }
-  input { width:100%; padding:7px 9px; background:var(--bg); color:var(--fg);
+  input, textarea { width:100%; padding:7px 9px; background:var(--bg); color:var(--fg);
           border:1px solid var(--line); border-radius:5px; font-size:13px; }
+  textarea { resize:vertical; font-family:ui-monospace,Menlo,monospace; }
   button { padding:8px 14px; background:var(--accent); color:#fff; border:0;
            border-radius:5px; font-size:13px; cursor:pointer; margin:4px 6px 4px 0; }
   button.ghost { background:transparent; border:1px solid var(--line); color:var(--fg); }
@@ -74,6 +75,13 @@
 
 <div class="panel">
   <h2>配置（留空 MQTT 字段则只写 WiFi/MAC）</h2>
+  <label>批量粘贴串口指令（多行 set &lt;key&gt; &lt;value&gt;，解析后填入下方表单）</label>
+  <textarea id="bulk" rows="5" placeholder="set wifi_ssid ChinaNet-7kMM
+set wifi_pass bpulumcd
+set mqtt_server m10363d1.ala.cn-hangzhou.emqxsl.cn
+set mqtt_port 8883"></textarea>
+  <button id="btnParse" class="ghost">解析填入</button>
+  <hr style="border:0;border-top:1px solid var(--line);margin:14px 0">
   <div class="row">
     <div><label>WiFi SSID</label><input id="ssid"></div>
     <div><label>WiFi 密码</label><input id="wpass" type="text"></div>
@@ -242,7 +250,32 @@ async function sendCmd(text) {
   }
 }
 
+// ── 批量解析串口指令 ─────────────────────────────────────────────────────────
+// 串口 CLI 的 key 名 → 网页表单字段 id
+const KEYMAP = {
+  wifi_ssid:  'ssid',     wifi_pass: 'wpass',    wol_mac:   'wolmac',
+  mqtt_server:'mqttsvr',  mqtt_port: 'mqttport', mqtt_user: 'mqttuser',
+  mqtt_pass:  'mqttpass', mqtt_id:   'mqttid',
+};
+
+function parseCommands() {
+  let filled = 0, skipped = 0;
+  for (const raw of $('bulk').value.split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    // set <key> <value>，value 可含空格
+    const m = line.match(/^set\s+(\S+)\s+(.+)$/i);
+    if (!m) { skipped++; log('跳过无法解析的行：' + line, 'log-mut'); continue; }
+    const key = m[1], val = m[2].trim();
+    const fid = KEYMAP[key];
+    if (fid) { $(fid).value = val; filled++; log(`填入 ${fid} = ${val}`); }
+    else     { skipped++; log('跳过未知 key：' + key, 'log-mut'); }
+  }
+  log(`解析完成：填入 ${filled} 项，跳过 ${skipped} 行`, filled ? 'log-ok' : 'log-err');
+}
+
 // ── 事件绑定 ─────────────────────────────────────────────────────────────────
+$('btnParse').onclick      = parseCommands;
 $('btnConnect').onclick    = connect;
 $('btnDisconnect').onclick = () => device?.gatt.disconnect();
 $('btnScan').onclick       = () => sendCmd('scan');
