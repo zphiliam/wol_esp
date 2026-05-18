@@ -32,6 +32,8 @@
  *   {"cmd":"ota","url":"https://..."}          OTA 升级（自动跟踪重定向，支持 GitHub release URL）
  *   {"cmd":"speedtest"}                         网络测速（HTTP 下载丢弃，默认 15s，MQTT 保持连接）
  *   {"cmd":"speedtest","url":"http://...","max_seconds":10}
+ *   {"cmd":"router_reboot","ip":"192.168.1.250","user":"admin","pass":"admin"}
+ *                                              重启当作交换机用的旧路由器（HTTP Basic Auth）
  */
 
 #if defined(ESP8266)
@@ -1251,6 +1253,60 @@ void doSpeedtest(const char* urlParam, int maxSeconds) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// doRouterReboot：向当作交换机使用的旧路由器发送 HTTP 重启指令
+//   目标为 Broadcom 公版固件旧路由器（HTTP/1.0 服务，Basic realm="Router"），
+//   其 cli.cgi 接口 cmd=reboot 触发重启、返回 HTTP 200
+//   机制：HTTP GET http://<ip>/<path>，可选 HTTP Basic Auth；HTTP 200 视为成功
+//   不做重启校验（路由器离线 30~60s），发完即上报；MQTT 全程保持连接
+//   ESP 自身经 WiFi 联网，与该路由器不在同一链路，重启它不影响本设备
+//   注：ESP 的 HTTPClient 直连目标，不经任何 HTTP 代理
+// ─────────────────────────────────────────────────────────────────────────────
+void doRouterReboot(const char* ip, const char* user, const char* pass, const char* path) {
+    char url[192];
+    snprintf(url, sizeof(url), "http://%s/%s", ip, path);
+    Serial.printf("[RTR] reboot → %s  user=%s\n", url, user);
+
+    bool   success  = false;
+    String failReason;
+    int    httpCode = 0;
+
+    {
+        WiFiClient c;
+        HTTPClient http;
+        http.setTimeout(ROUTER_HTTP_TIMEOUT_MS);
+        http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+
+        if (!http.begin(c, url)) {
+            failReason = F("http.begin failed");
+        } else {
+            if (strlen(user) > 0 || strlen(pass) > 0) {
+                http.setAuthorization(user, pass);
+            }
+            httpCode = http.GET();
+            Serial.printf("[RTR] HTTP %d\n", httpCode);
+            if (httpCode == HTTP_CODE_OK) {
+                success = true;
+            } else if (httpCode < 0) {
+                failReason = String(F("HTTP error: ")) + HTTPClient::errorToString(httpCode);
+            } else {
+                failReason = String(F("HTTP ")) + httpCode;
+            }
+            http.end();
+        }
+    }
+
+    StaticJsonDocument<192> doc;
+    if (success) {
+        doc["event"]     = "router_reboot";
+        doc["http_code"] = httpCode;
+    } else {
+        doc["event"]  = "router_reboot_fail";
+        doc["reason"] = failReason;
+    }
+    pubJson(doc);  // appends uptime / heap / ip
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // doSetMqtt：在线更新 MQTT 连接配置
 //   流程：断开当前 MQTT → 临时客户端测试新连接 → 成功则保存并重启，失败则恢复原连接
 //   注意：测试客户端与主客户端顺序使用，避免双 TLS 上下文同时占用内存（ESP8266 关键）
@@ -1495,6 +1551,18 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
         const char* url = doc["url"] | SPEEDTEST_DEFAULT_URL;
         int maxSec      = doc["max_seconds"] | SPEEDTEST_DEFAULT_SECS;
         doSpeedtest(url, maxSec);
+
+    // ── router_reboot ──
+    } else if (strcmp(cmd, "router_reboot") == 0) {
+        const char* ip   = doc["ip"]   | "";
+        const char* user = doc["user"] | "";
+        const char* pass = doc["pass"] | "";
+        const char* path = doc["path"] | ROUTER_REBOOT_PATH;
+        if (strlen(ip) == 0) {
+            pubEvent("error:router_ip_missing");
+        } else {
+            doRouterReboot(ip, user, pass, path);
+        }
 
     // ── 未知指令 ──
     } else {

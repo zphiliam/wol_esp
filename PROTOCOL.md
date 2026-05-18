@@ -123,6 +123,27 @@
 - 计时从收到首字节开始，不含 TCP 握手和 HTTP 头部解析耗时
 - 执行前检查 heap 连续可用块，不足 6144 字节时拒绝并返回 `error:heap_low`
 
+### 重启路由器/交换机
+
+向局域网内一台旧路由器（当作交换机用）发送 HTTP 重启指令。
+
+```json
+{"cmd":"router_reboot","ip":"192.168.1.250","user":"admin","pass":"admin"}
+```
+
+自定义重启接口路径：
+```json
+{"cmd":"router_reboot","ip":"192.168.1.250","user":"admin","pass":"admin","path":"cli.cgi?cmd=reboot"}
+```
+
+- `ip`：**必填**，目标路由器的局域网 IP 或主机名
+- `user` / `pass`：可选，HTTP Basic Auth 凭据；两者均省略则不带认证
+- `path`：可选，重启接口路径（不含前导 `/`），默认 `cli.cgi?cmd=reboot`
+- 机制：发起 `GET http://<ip>/<path>`，HTTP 200 即视为成功
+- 不做重启校验（路由器离线期较长），发完即上报 `router_reboot` / `router_reboot_fail`
+- ESP 设备经 WiFi 联网，与目标路由器不在同一链路，重启它不影响本设备与 MQTT 连接
+- 凭据不持久化，由每次指令携带（适合 Home Assistant 等自动化定时触发）
+
 ---
 
 ## 上行事件
@@ -296,6 +317,32 @@
 }
 ```
 
+### 路由器重启事件
+
+重启指令发送成功（路由器返回 HTTP 200）：
+```json
+{
+  "event": "router_reboot",
+  "http_code": 200,
+  "uptime": 3600,
+  "heap": 44000,
+  "ip": "192.168.1.100"
+}
+```
+
+重启指令发送失败：
+```json
+{
+  "event": "router_reboot_fail",
+  "reason": "HTTP 401",
+  "uptime": 3600,
+  "heap": 44000,
+  "ip": "192.168.1.100"
+}
+```
+
+> `reason` 取值示例：`HTTP 401`（认证失败）、`HTTP error: ...`（连接错误）、`http.begin failed`
+
 ### OTA 事件
 
 升级开始（MQTT 断开前发出）：
@@ -376,4 +423,5 @@
 | `error:ota_url_missing` | ota 指令缺少 `url` 字段 |
 | `error:heap_low` | speedtest 执行时 heap 连续可用块不足 6144 字节 |
 | `error:set_mqtt_no_change` | set_mqtt 指令所有字段均与当前配置相同 |
+| `error:router_ip_missing` | router_reboot 指令缺少 `ip` 字段 |
 | `error:mqtt_connect_failed` | set_mqtt 指令测试连接失败，原配置保留（附 `rc` 字段）|

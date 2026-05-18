@@ -171,6 +171,8 @@ save
 {"cmd":"set","key":"status_interval","val":60}       // 设置心跳间隔（秒），0 为禁用
 {"cmd":"reboot"}                                     // 重启设备
 {"cmd":"ota","url":"https://.../firmware.bin"}       // OTA 空中升级
+{"cmd":"speedtest"}                                  // 网络测速（下载丢弃）
+{"cmd":"router_reboot","ip":"192.168.1.250","user":"admin","pass":"admin"}  // 重启用作交换机的旧路由器
 ```
 
 ## OTA 升级

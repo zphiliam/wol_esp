@@ -31,5 +31,16 @@
 #define SPEEDTEST_DEFAULT_SECS  15     // 秒，默认测速时长上限
 #define SPEEDTEST_MIN_HEAP      6144   // 触发测速前要求的最大连续 heap（字节）
 
+// ── 路由器重启 ────────────────────────────────────────────────────────────────
+// 目标为一台当交换机用的 ~2010 年代国产白牌旧路由器，采用 Broadcom 系 SoC，
+// 固件为 "WEB SDK" 型公版 Web GUI（wdk.js / cdb 配置数据库 / product.js）。
+//   · HTTP 服务：HTTP/1.0，Server: "HTTP Server"，HTTP Basic 认证 realm="Router"
+//   · 所有动态操作经 cli.cgi?cmd=<CLI命令>；CLI 含 wan/status/save/commit/upgrade/
+//     ping/arp/route/ifcfg/time/echo/mdio/mactbl 等（mdio/mactbl 即内置交换机诊断）
+//   · cmd=reboot 触发重启并返回 HTTP 200（未列入 help，但实测可用）
+//   · 探测到固件 $sw_ver=2.0 p40 / $hw_ver=1.0.2.0 / 引导版本 $hw_bver=0.0.9.4
+#define ROUTER_REBOOT_PATH      "cli.cgi?cmd=reboot"  // 默认重启接口路径（不含前导 /）
+#define ROUTER_HTTP_TIMEOUT_MS  10000                 // 毫秒，路由器 HTTP 请求超时
+
 // ── 版本 ──────────────────────────────────────────────────────────────────────
-#define FW_VERSION  "2.4.6-20260501"
+#define FW_VERSION  "2.5.0-20260518"

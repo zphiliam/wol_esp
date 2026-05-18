@@ -50,6 +50,22 @@
 
 ---
 
-## 待规划
+## ✅ OTA 固件升级（v2.3.x）
 
-- OTA 固件升级
+通过 MQTT 指令空中升级固件，免拆机重新烧录。
+
+- `{"cmd":"ota","url":"..."}` 触发，流式下载写入 Flash
+- 自动跟踪 HTTP 重定向，支持 GitHub release URL
+- ESP8266 用内置 `ESP8266httpUpdate`，ESP32-C3 用 `HTTPClient` + `Update`
+- 成功后自动重启并发布 `ota_success`，失败发布 `ota_fail`
+
+---
+
+## ✅ 重启路由器/交换机指令（v2.5.0-20260518）
+
+新增 `router_reboot` 指令，通过 HTTP 重启局域网内当作交换机使用的旧路由器。
+
+- `{"cmd":"router_reboot","ip":"...","user":"...","pass":"..."}` 触发
+- 对目标发起 HTTP GET（可选 Basic Auth），HTTP 200 视为成功
+- 凭据由指令携带、不持久化，定时调度交给云端 MQTT 发送方
+- 复用 speedtest 同款 HTTPClient 写法，ESP8266/ESP32-C3 通用
