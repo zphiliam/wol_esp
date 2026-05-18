@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<!--
+  WoL ESP32-C3 — BLE 配网测试页（Web Bluetooth）
+
+  用途：测试固件阶段 1 的明文 BLE 配网 GATT 服务，自动处理分片协议。
+  也可作为微信小程序 BLE 配网逻辑的参考实现。
+
+  使用方法（需安全上下文，file:// 打不开）：
+    cd test && python3 -m http.server 8000
+    Chrome 打开 http://localhost:8000/ble_test.html
+  支持平台：桌面版 / Android 版 Chrome、Edge（iOS Safari 不支持 Web Bluetooth）。
+
+  GATT（详见 docs/BLE_REDESIGN.md）：
+    service e0c1a700  command(写) status(读+通知) scan(读+通知) config(写)
+    分片头 4 字节 [总长 LE:2][序号:1][标志:1]，标志 bit0=末片
+    status 通知为纯文本（不分片）；scan 通知与 config 写入走分片协议
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WoL ESP32-C3 — BLE 配网测试</title>
+<style>
+  :root { --bg:#15171c; --panel:#1e2128; --line:#2e323c; --fg:#d8dce4;
+          --accent:#5b9dff; --ok:#54c98a; --err:#f0676b; --muted:#7c8290; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:18px; background:var(--bg); color:var(--fg);
+         font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; }
+  h1 { font-size:17px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:12px; margin-bottom:14px; }
+  .panel { background:var(--panel); border:1px solid var(--line);
+           border-radius:8px; padding:14px; margin-bottom:12px; }
+  .panel h2 { font-size:13px; margin:0 0 10px; color:var(--muted);
+              text-transform:uppercase; letter-spacing:.05em; }
+  label { display:block; font-size:12px; color:var(--muted); margin:8px 0 3px; }
+  input { width:100%; padding:7px 9px; background:var(--bg); color:var(--fg);
+          border:1px solid var(--line); border-radius:5px; font-size:13px; }
+  button { padding:8px 14px; background:var(--accent); color:#fff; border:0;
+           border-radius:5px; font-size:13px; cursor:pointer; margin:4px 6px 4px 0; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--fg); }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; }
+  .row > div { flex:1; min-width:130px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%;
+         background:var(--err); margin-right:6px; vertical-align:middle; }
+  .dot.on { background:var(--ok); }
+  #nets div { padding:6px 9px; border:1px solid var(--line); border-radius:5px;
+              margin:4px 0; cursor:pointer; display:flex; justify-content:space-between; }
+  #nets div:hover { border-color:var(--accent); }
+  #log { background:#0f1115; border:1px solid var(--line); border-radius:6px;
+         padding:10px; height:190px; overflow:auto; font-family:ui-monospace,Menlo,monospace;
+         font-size:12px; white-space:pre-wrap; }
+  .log-ok { color:var(--ok); } .log-err { color:var(--err); }
+  .log-rx { color:var(--accent); } .log-mut { color:var(--muted); }
+</style>
+</head>
+<body>
+
+<h1>WoL ESP32-C3 — BLE 配网测试</h1>
+<div class="sub">Web Bluetooth · 自动分片 · 阶段 1（明文 GATT）</div>
+
+<div class="panel">
+  <h2><span id="dot" class="dot"></span><span id="connState">未连接</span></h2>
+  <button id="btnConnect">连接设备</button>
+  <button id="btnDisconnect" class="ghost" disabled>断开</button>
+  <button id="btnScan" class="ghost" disabled>扫描 WiFi</button>
+  <button id="btnReboot" class="ghost" disabled>重启设备</button>
+</div>
+
+<div class="panel">
+  <h2>WiFi 扫描结果（点击填入 SSID）</h2>
+  <div id="nets"><span class="log-mut">— 连接后点「扫描 WiFi」—</span></div>
+</div>
+
+<div class="panel">
+  <h2>配置（留空 MQTT 字段则只写 WiFi/MAC）</h2>
+  <div class="row">
+    <div><label>WiFi SSID</label><input id="ssid"></div>
+    <div><label>WiFi 密码</label><input id="wpass" type="text"></div>
+  </div>
+  <label>WoL 目标 MAC（12 位十六进制，无分隔符）</label>
+  <input id="wolmac" placeholder="AABBCCDDEEFF" maxlength="12">
+  <div class="row">
+    <div><label>MQTT 服务器</label><input id="mqttsvr"></div>
+    <div><label>MQTT 端口</label><input id="mqttport" value="8883"></div>
+  </div>
+  <div class="row">
+    <div><label>MQTT 用户名</label><input id="mqttuser"></div>
+    <div><label>MQTT 密码</label><input id="mqttpass" type="text"></div>
+  </div>
+  <label>MQTT Client ID</label><input id="mqttid">
+  <div style="margin-top:12px"><button id="btnSave" disabled>下发配置并重启</button></div>
+</div>
+
+<div class="panel">
+  <h2>日志</h2>
+  <div id="log"></div>
+</div>
+
+<script>
+const SVC    = 'e0c1a700-2b3a-4f5c-9d7e-1a2b3c4d5e6f';
+const CMD    = 'e0c1a701-2b3a-4f5c-9d7e-1a2b3c4d5e6f';
+const STATUS = 'e0c1a702-2b3a-4f5c-9d7e-1a2b3c4d5e6f';
+const SCAN   = 'e0c1a703-2b3a-4f5c-9d7e-1a2b3c4d5e6f';
+const CFG    = 'e0c1a704-2b3a-4f5c-9d7e-1a2b3c4d5e6f';
+
+const FRAG_HEADER = 4;     // 分片头字节数
+const FRAG_CHUNK  = 180;   // 每片 payload 上限（与固件 BLE_FRAG_CHUNK 一致）
+
+let device, chCmd, chCfg;
+let scanRx = null;         // scan 分片重组缓冲 { total, buf:[] }
+
+const $ = id => document.getElementById(id);
+const enc = new TextEncoder(), dec = new TextDecoder();
+
+function log(msg, cls) {
+  const el = $('log');
+  const t = new Date().toTimeString().slice(0, 8);
+  const span = document.createElement('span');
+  span.className = cls || '';
+  span.textContent = `[${t}] ${msg}\n`;
+  el.appendChild(span);
+  el.scrollTop = el.scrollHeight;
+}
+
+function setConnected(on) {
+  $('dot').classList.toggle('on', on);
+  $('connState').textContent = on ? `已连接 ${device?.name || ''}` : '未连接';
+  $('btnConnect').disabled = on;
+  ['btnDisconnect','btnScan','btnReboot','btnSave'].forEach(id => $(id).disabled = !on);
+}
+
+// ── 连接 ─────────────────────────────────────────────────────────────────────
+async function connect() {
+  try {
+    log('请求设备…');
+    device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }] });
+    device.addEventListener('gattserverdisconnected', () => {
+      setConnected(false); log('设备已断开', 'log-err');
+    });
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SVC);
+    chCmd = await svc.getCharacteristic(CMD);
+    chCfg = await svc.getCharacteristic(CFG);
+
+    const chStatus = await svc.getCharacteristic(STATUS);
+    await chStatus.startNotifications();
+    chStatus.addEventListener('characteristicvaluechanged', e => {
+      const txt = dec.decode(e.target.value);   // status 为纯文本，不分片
+      log('status ◀ ' + txt, txt.startsWith('error') ? 'log-err' : 'log-rx');
+    });
+
+    const chScan = await svc.getCharacteristic(SCAN);
+    await chScan.startNotifications();
+    chScan.addEventListener('characteristicvaluechanged', e => onScanFragment(e.target.value));
+
+    setConnected(true);
+    log('连接成功，4 个特征就绪', 'log-ok');
+  } catch (err) {
+    log('连接失败：' + err.message, 'log-err');
+  }
+}
+
+// ── scan 分片重组 ────────────────────────────────────────────────────────────
+function onScanFragment(dv) {
+  if (dv.byteLength < FRAG_HEADER) return;
+  const total = dv.getUint16(0, true);
+  const seq   = dv.getUint8(2);
+  const flags = dv.getUint8(3);
+  const payload = new Uint8Array(dv.buffer, dv.byteOffset + FRAG_HEADER,
+                                 dv.byteLength - FRAG_HEADER);
+  if (seq === 0) scanRx = { total, buf: [] };
+  if (!scanRx) return;
+  scanRx.buf.push(...payload);
+  if (flags & 0x01) {
+    const bytes = new Uint8Array(scanRx.buf);
+    log(`scan ◀ 重组完成 ${bytes.length}/${scanRx.total} 字节`, 'log-rx');
+    try { renderNets(JSON.parse(dec.decode(bytes))); }
+    catch (e) { log('scan JSON 解析失败：' + e.message, 'log-err'); }
+    scanRx = null;
+  }
+}
+
+function renderNets(list) {
+  const box = $('nets');
+  box.innerHTML = '';
+  if (!list.length) { box.innerHTML = '<span class="log-mut">— 未扫描到网络 —</span>'; return; }
+  list.sort((a, b) => b.rssi - a.rssi).forEach(n => {
+    const div = document.createElement('div');
+    div.innerHTML = `<span>${n.ssid || '(隐藏)'}</span><span class="log-mut">${n.rssi} dBm</span>`;
+    div.onclick = () => { $('ssid').value = n.ssid; log('已填入 SSID: ' + n.ssid); };
+    box.appendChild(div);
+  });
+}
+
+// ── 分片写入 config ──────────────────────────────────────────────────────────
+async function writeFragmented(ch, bytes) {
+  const total = bytes.length;
+  let seq = 0;
+  for (let off = 0; off < total || total === 0; off += FRAG_CHUNK) {
+    const plen = Math.min(FRAG_CHUNK, total - off);
+    const pkt = new Uint8Array(FRAG_HEADER + plen);
+    pkt[0] = total & 0xFF;
+    pkt[1] = (total >> 8) & 0xFF;
+    pkt[2] = seq++;
+    pkt[3] = (off + plen >= total) ? 0x01 : 0x00;   // bit0 = 末片
+    pkt.set(bytes.subarray(off, off + plen), FRAG_HEADER);
+    await ch.writeValueWithResponse(pkt);
+    if (total === 0) break;
+  }
+  log(`config ▶ 已发送 ${total} 字节，分 ${seq} 片`, 'log-ok');
+}
+
+async function save() {
+  const cfg = {
+    ssid:   $('ssid').value.trim(),
+    wpass:  $('wpass').value,
+    wolmac: $('wolmac').value.trim(),
+  };
+  const svr = $('mqttsvr').value.trim();
+  if (svr) {
+    cfg.mqttsvr  = svr;
+    cfg.mqttport = parseInt($('mqttport').value) || 8883;
+    cfg.mqttuser = $('mqttuser').value.trim();
+    cfg.mqttpass = $('mqttpass').value;
+    cfg.mqttid   = $('mqttid').value.trim();
+  }
+  try {
+    await writeFragmented(chCfg, enc.encode(JSON.stringify(cfg)));
+    log('等待设备校验，结果见 status 通知…', 'log-mut');
+  } catch (err) {
+    log('下发失败：' + err.message, 'log-err');
+  }
+}
+
+async function sendCmd(text) {
+  try {
+    await chCmd.writeValueWithResponse(enc.encode(text));
+    log('command ▶ ' + text, 'log-ok');
+  } catch (err) {
+    log('指令失败：' + err.message, 'log-err');
+  }
+}
+
+// ── 事件绑定 ─────────────────────────────────────────────────────────────────
+$('btnConnect').onclick    = connect;
+$('btnDisconnect').onclick = () => device?.gatt.disconnect();
+$('btnScan').onclick       = () => sendCmd('scan');
+$('btnReboot').onclick     = () => sendCmd('reboot');
+$('btnSave').onclick       = save;
+
+if (!navigator.bluetooth) {
+  log('当前浏览器不支持 Web Bluetooth，请用桌面/安卓版 Chrome 或 Edge。', 'log-err');
+  $('btnConnect').disabled = true;
+}
+</script>
+</body>
+</html>
