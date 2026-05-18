@@ -613,7 +613,7 @@ String applyAndSaveConfig(const String& ssidIn, const String& wpass, const Strin
 #define BLE_FRAG_HEADER   4       // 分片头字节数
 #define BLE_FRAG_CHUNK    180     // 分片 payload 上限（留足 MTU 余量）
 #define BLE_CFG_BUF_SIZE  1024    // 配置载荷重组缓冲上限
-#define BLE_PROV_TIMEOUT  (5UL * 60 * 1000)  // 无连接超时（ms）
+#define BLE_PROV_TIMEOUT  (5UL * 60 * 1000)  // 配网模式超时（ms，仅对已配置设备生效）
 #define BLE_PSK_LEN       16                 // per-device 预共享密钥字节数
 #define BLE_PSK_FILE      "/ble_psk.bin"
 #define BLE_GCM_IV_LEN    12      // AES-GCM 随机 IV 长度
@@ -861,7 +861,8 @@ static void bleProcessConfig() {
         return;
     }
     bleSetStatus("ok:rebooting");
-    delay(1000);   // 给 notify 发送窗口
+    digitalWrite(LED_PIN, LOW);   // LED 常亮提示配置成功
+    delay(1000);                  // 给 notify 发送窗口
     ESP.restart();
 }
 
@@ -921,10 +922,11 @@ void enterBLEProvMode() {
     Serial.println(F("[BLE] advertising started, waiting for client..."));
     Serial.println(F("[BLE] serial recovery: type 'config' for serial CLI"));
 
+    // 设备是否已有有效配置：决定超时行为（无配置时重启只会再进本模式，故常驻）
+    bool hasConfig = LittleFS.exists("/config.json");
     unsigned long startMs   = millis();
     unsigned long lastBlink = 0;
-    bool ledOn        = false;
-    bool everConnected = false;
+    bool ledOn = false;
 
     while (true) {
         yield();
@@ -952,18 +954,17 @@ void enterBLEProvMode() {
             }
         }
 
-        // LED 500ms 慢闪提示配网模式
-        if (millis() - lastBlink >= 500) {
+        // LED 闪烁：未连接 500ms 慢闪，客户端已连接 150ms 快闪（连接反馈）
+        if (millis() - lastBlink >= (bleClientConnected ? 150UL : 500UL)) {
             ledOn = !ledOn;
             digitalWrite(LED_PIN, ledOn ? LOW : HIGH);
             lastBlink = millis();
         }
 
-        if (bleClientConnected) everConnected = true;
-
-        // 5 分钟无任何连接 → 重启回正常运行（防按键误触卡死）
-        if (!everConnected && millis() - startMs > BLE_PROV_TIMEOUT) {
-            Serial.println(F("[BLE] no client within timeout → restart"));
+        // 配网超时 → 重启回正常运行（防按键误触/连上又中途放弃使设备长期滞留）。
+        // 仅对已有配置的设备生效；无配置设备常驻配网（重启也只会再进本模式）。
+        if (hasConfig && millis() - startMs > BLE_PROV_TIMEOUT) {
+            Serial.println(F("[BLE] provisioning timeout → restart"));
             delay(100);
             ESP.restart();
         }

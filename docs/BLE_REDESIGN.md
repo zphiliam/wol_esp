@@ -154,3 +154,48 @@ TLS + BLE GATT + ECDH 缓冲同时占用导致 OOM。
   Web Crypto 输出为 `密文‖tag`,客户端需重排为 `iv‖tag‖密文`。
 - 设备未完成握手时拒收 config;解密验签失败回 `error:` 状态。
 - `scan` / `status` 仍为明文(SSID、状态文本非敏感)。
+
+### 固件收尾(随阶段 2 复查完成)✅
+
+- BLE 模式超时改为绝对计时:仅对**已有配置**的设备生效(无配置设备常驻配网,
+  重启也只会再进本模式);修掉了「连上又中途放弃 → 永久卡死」的 bug。
+- LED:未连接 500ms 慢闪,客户端已连接 150ms 快闪,配置成功常亮。
+
+## 9. 阶段 3 待办:微信小程序
+
+> 设备/固件侧已完工,阶段 3 是纯客户端工作。`test/ble_test.html` 是完整的
+> 参考实现,小程序逻辑可照搬。
+
+### 前置条件
+
+- 微信小程序 AppID(微信公众平台注册,个人可注册)
+- 微信开发者工具(Mac 端)
+- 一台真手机:**BLE 在模拟器中不可用**,必须真机调试
+
+### 关键技术点
+
+- **加密库**:小程序无 Web Crypto,X25519 与 AES-256-GCM 需打包纯 JS 库。
+  推荐 `@noble/curves`(x25519)+ `@noble/ciphers`(aes-gcm),或 tweetnacl。
+- **BLE API**:`wx.openBluetoothAdapter` / `startBluetoothDevicesDiscovery` /
+  `createBLEConnection` / `getBLEDeviceServices` / `getBLEDeviceCharacteristics` /
+  `writeBLECharacteristicValue` / `notifyBLECharacteristicValueChange` /
+  `onBLECharacteristicValueChange`。
+- **MTU**:`wx.setBLEMTU` 仅安卓有效,iOS 自动协商;分片协议照搬测试页。
+- **PSK 获取**:`wx.scanCode` 扫设备二维码,解析 `{id, psk}`(分发方案见下)。
+
+### 功能流程
+
+扫二维码取 PSK → 扫描 BLE 设备 → 连接 `WoL-XXXX` → X25519 握手 →
+触发 WiFi 扫描 → 填表单 → AES-GCM 加密下发 → 显示 status 结果。
+
+### PSK 分发方案(已定)
+
+**设备贴二维码**:PSK + deviceID 印在设备底部/内侧标签,小程序扫码获取。
+二维码内容形如 `{"id":"WoL-7kMM","psk":"<32 hex>"}`。
+安全性结论:配网模式按键门控 + PSK 不过空气,二维码方案对家用场景安全。
+产线流程:固件首次开机自生成 PSK → 串口读出 → 印二维码贴上。
+
+### 可选(后续)
+
+- 小程序后台维护各设备最新 MQTT 凭据,换服务器时一键下发。
+- 工程位置:`miniprogram/` 子目录或独立仓库(待定)。
