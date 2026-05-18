@@ -1,20 +1,21 @@
 /**
- * WoL ESP32-C3 — C++ Arduino 版  v2.2
+ * WoL ESP32-C3 — C++ Arduino 版  v3.0
  *
  * 功能：通过 MQTT 远程唤醒局域网内电脑
  * 硬件：ESP32-C3 SuperMini（LED GPIO8，active LOW）
  *
  * 依赖库（Arduino IDE 库管理器安装）：
- *   - PubSubClient  by Nick O'Leary
- *   - ArduinoJson   by Benoit Blanchon
+ *   - PubSubClient    by Nick O'Leary
+ *   - ArduinoJson     by Benoit Blanchon
+ *   - NimBLE-Arduino  by h2zero
  *
  * 配置：凭据存于 LittleFS /config.json，固件本身不含敏感信息
- *   首次无配置                        → 直接进入串口 CLI
- *   运行时串口输入 "config" + 回车    → 写 /reconfig → 重启 → 串口 CLI
- *   运行时串口输入 "ap" + 回车        → 写 /softap  → 重启 → SoftAP 网页配置
- *   运行时按住 FLASH/BOOT 键 3s 松手 → 写 /softap  → 重启 → SoftAP 网页配置
- *   运行时按住 FLASH/BOOT 键 10s     → 写 /reconfig → 重启 → 串口 CLI（配置保留）
- *   串口 CLI 输入 help 查看命令列表；SoftAP SSID：WoL-Setup-XXXX，IP：192.168.4.1
+ *   首次无配置                   → 自动进入 BLE 配网模式
+ *   运行时串口输入 "ble" + 回车  → 写 /bleprov → 重启 → BLE 配网
+ *   运行时按住 BOOT 键 3s 松手   → 写 /bleprov → 重启 → BLE 配网（配置保留）
+ *   运行时按住 BOOT 键 10s       → 工厂重置（清空配置）→ 重启 → BLE 配网
+ *   串口输入 "config"（隐藏恢复通道）→ 写 /reconfig → 重启 → 串口 CLI
+ *   BLE 设备名 WoL-XXXX；GATT 协议见 docs/BLE_REDESIGN.md
  *
  * 主题（运行时由 mqtt_id 拼接）：
  *   下行指令  home/wol/{mqtt_id}/cmd
@@ -49,10 +50,7 @@
 // ── BLE 配网（NimBLE-Arduino） ────────────────────────────────────────────────
 #include <NimBLEDevice.h>
 
-// ── WebServer + DNS（配置 AP 模式 / Captive Portal） ─────────────────────────
-#include <WebServer.h>
-#include <DNSServer.h>
-#include "esp_wifi.h"   // esp_wifi_set_ps()
+#include "esp_wifi.h"   // esp_wifi_set_max_tx_power()
 
 // ── 硬件 ──────────────────────────────────────────────────────────────────────
 const uint8_t LED_PIN = 8;   // ESP32-C3 SuperMini，active LOW
@@ -68,7 +66,6 @@ struct DevConfig {
     char     mqtt_id[32];
     char     wol_mac[13];    // 12 位十六进制 + '\0'
     bool     wifi_ever_ok;   // 是否曾经成功连接过 WiFi（决定超时策略）
-    bool     ap_full_config; // SoftAP 网页是否显示完整 MQTT 配置字段
     int8_t   wifi_tx_power;  // WiFi 发射功率（dBm，2-20）；0 表示使用平台默认值
 } cfg;
 
@@ -96,8 +93,6 @@ char TOPIC_PUB[64];
 WiFiClientSecure wifiClient;
 PubSubClient     mqtt(wifiClient);
 WiFiUDP          udp;
-WebServer        apServer(80);
-DNSServer        dnsServer;
 
 // ── 运行时可修改的配置 ────────────────────────────────────────────────────────
 unsigned long statusIntervalMs = (unsigned long)STATUS_INTERVAL_DEFAULT * 1000;
@@ -138,7 +133,6 @@ bool saveConfig() {
     doc["mqtt_id"]      = cfg.mqtt_id;
     doc["wol_mac"]       = cfg.wol_mac;
     doc["wifi_ever_ok"]  = cfg.wifi_ever_ok;
-    doc["ap_full_config"]  = cfg.ap_full_config;
     doc["wifi_tx_power"]   = cfg.wifi_tx_power;
     File f = LittleFS.open("/config.json", "w");
     if (!f) return false;
@@ -166,7 +160,6 @@ bool loadConfig() {
     strlcpy(cfg.mqtt_id,     doc["mqtt_id"]      | "", sizeof(cfg.mqtt_id));
     strlcpy(cfg.wol_mac,     doc["wol_mac"]      | "", sizeof(cfg.wol_mac));
     cfg.wifi_ever_ok   = doc["wifi_ever_ok"]   | false;
-    cfg.ap_full_config = doc["ap_full_config"] | false;
     // 默认值：ESP32-C3 SuperMini 天线设计缺陷+LDO电流不足，15dBm 最稳定（ESP3D 实测推荐）
     cfg.wifi_tx_power  = doc["wifi_tx_power"]  | 15;
 
@@ -353,11 +346,9 @@ static void printConfigHelp() {
     Serial.println(F("  set mqtt_pass   <value>"));
     Serial.println(F("  set mqtt_id     <value>"));
     Serial.println(F("  set wol_mac        <value>  (12 hex chars, no separators)"));
-    Serial.println(F("  set ap_full_config <true|false>  (show MQTT fields in SoftAP page)"));
     Serial.println(F("  set wifi_tx_power  <2-20|0>      (dBm; 0=platform default; ESP32-C3 推荐 15)"));
     Serial.println(F("  show   - display staged config"));
     Serial.println(F("  save   - write to flash and reboot"));
-    Serial.println(F("  ap     - write /softap flag and reboot into SoftAP mode"));
     Serial.println(F("  ble    - write /bleprov flag and reboot into BLE provisioning"));
     Serial.println(F("  reset  - erase config and reboot"));
     Serial.println(F("  reboot - reboot immediately"));
@@ -414,7 +405,6 @@ void enterConfigMode() {
                 Serial.println(F("[Device]"));
                 Serial.printf("  wol_mac   : %s\n",  staged.wol_mac);
                 Serial.printf("  tx_power  : %ddBm%s\n", staged.wifi_tx_power, staged.wifi_tx_power == 0 ? " (default)" : "");
-                Serial.printf("  ap_full   : %s\n",   staged.ap_full_config ? "true" : "false");
                 Serial.println(F("---------------------------"));
 
             } else if (line == "wifi list") {
@@ -469,20 +459,6 @@ void enterConfigMode() {
                     }
                 }
 
-            } else if (line == "ap") {
-                if (!LittleFS.exists("/config.json")) {
-                    memset(&cfg, 0, sizeof(cfg));
-                    cfg.ap_full_config = true;
-                    cfg.mqtt_port = 8883;
-                    saveConfig();
-                    Serial.println(F("[CFG] no config.json → wrote minimal config with ap_full_config=true"));
-                }
-                writeFlag("/softap");
-                Serial.println(F("[CFG] /softap flag written, rebooting into SoftAP..."));
-                digitalWrite(LED_PIN, HIGH);
-                delay(300);
-                ESP.restart();
-
             } else if (line == "ble") {
                 writeFlag("/bleprov");
                 Serial.println(F("[CFG] /bleprov flag written, rebooting into BLE mode..."));
@@ -532,8 +508,6 @@ void enterConfigMode() {
                         for (int i = 0; hexOk && i < 12; i++) hexOk = isxdigit((unsigned char)val[i]);
                         if (!hexOk) { Serial.println(F("[CFG] error: wol_mac must be 12 hex chars")); valid = false; }
                         else strlcpy(staged.wol_mac, val.c_str(), sizeof(staged.wol_mac));
-                    } else if (key == "ap_full_config") {
-                        staged.ap_full_config = (val == "true" || val == "1");
                     } else if (key == "wifi_tx_power") {
                         int p = val.toInt();
                         if (p != 0 && (p < 2 || p > 20)) {
@@ -572,52 +546,10 @@ void checkReconfigFlag() {
     enterConfigMode();  // 永不返回
 }
 
-#include "ap_html.h"
-
 // ─────────────────────────────────────────────────────────────────────────────
-// SoftAP 网页处理器
-// ─────────────────────────────────────────────────────────────────────────────
-static void handleAPConfig() {
-    StaticJsonDocument<512> doc;
-    doc["ssid"]           = cfg.wifi_ssid;
-    doc["wpass"]          = cfg.wifi_pass;
-    doc["wolmac"]         = cfg.wol_mac;
-    doc["ap_full_config"] = cfg.ap_full_config;
-    doc["version"]        = FW_VERSION;
-    doc["mqtt_server"]    = cfg.mqtt_server;
-    doc["mqtt_port"]      = cfg.mqtt_port;
-    doc["mqtt_user"]      = cfg.mqtt_user;
-    doc["mqtt_pass"]      = cfg.mqtt_pass;
-    doc["mqtt_id"]        = cfg.mqtt_id;
-    String json;
-    serializeJson(doc, json);
-    apServer.send(200, "application/json", json);
-}
-
-static void handleAPScan() {
-    // scanNetworks() 默认已按 RSSI 降序排列（信号最强在前）
-    int n = WiFi.scanNetworks();
-    String json = "[";
-    for (int i = 0; i < n; i++) {
-        if (i > 0) json += ",";
-        String ssid = WiFi.SSID(i);
-        ssid.replace("\\", "\\\\");
-        ssid.replace("\"", "\\\"");
-        int rssi = WiFi.RSSI(i);
-        json += "{\"ssid\":\"" + ssid + "\",\"rssi\":" + String(rssi) + "}";
-    }
-    json += "]";
-    WiFi.scanDelete();
-    apServer.send(200, "application/json", json);
-}
-
-static void handleAPRoot() {
-    apServer.send(200, "text/html", FPSTR(CONFIG_HTML));
-}
-
 // applyAndSaveConfig：校验并落盘一组配置字段，返回 ""=成功，否则为错误描述。
-// SoftAP 网页与 BLE 配网共用此函数,确保两条配网路径的校验与落盘逻辑一致。
 //   withMqtt=false 时只写 WiFi/MAC,不触碰 MQTT 字段(保留现有值)。
+// ─────────────────────────────────────────────────────────────────────────────
 String applyAndSaveConfig(const String& ssidIn, const String& wpass, const String& wolmacIn,
                           bool withMqtt, const String& mqttsvrIn, int mqttport,
                           const String& mqttuser, const String& mqttpass, const String& mqttidIn) {
@@ -653,96 +585,6 @@ String applyAndSaveConfig(const String& ssidIn, const String& wpass, const Strin
 
     if (!saveConfig()) return "配置写入 LittleFS 失败。";
     return "";
-}
-
-static void handleAPSave() {
-    String err = applyAndSaveConfig(
-        apServer.arg("ssid"),  apServer.arg("wpass"), apServer.arg("wolmac"),
-        cfg.ap_full_config,
-        apServer.arg("mqttsvr"), apServer.arg("mqttport").toInt(),
-        apServer.arg("mqttuser"), apServer.arg("mqttpass"), apServer.arg("mqttid"));
-
-    if (err.length() > 0) {
-        StaticJsonDocument<192> errDoc;
-        errDoc["ok"]    = false;
-        errDoc["error"] = err;
-        String errJson;
-        serializeJson(errDoc, errJson);
-        apServer.send(400, "application/json", errJson);
-        return;
-    }
-
-    Serial.println(F("[AP] config saved, rebooting..."));
-    apServer.send(200, "application/json", F("{\"ok\":true}"));
-    delay(1500);
-    ESP.restart();
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// enterSoftAPMode：启动 SoftAP + HTTP 配置服务器，永不返回
-// ─────────────────────────────────────────────────────────────────────────────
-void enterSoftAPMode() {
-    // 计算 AP SSID（chip ID 末 4 位十六进制，两平台均可）
-    char apSSID[20];
-    snprintf(apSSID, sizeof(apSSID), "WoL-Setup-%04X", (uint16_t)(ESP.getEfuseMac() & 0xFFFF));
-
-    // ESP32-C3：彻底停掉 STA，关闭省电模式（否则 beacon 不广播）
-    // WIFI_AP_STA：保留 STA 射频，使 scanNetworks() 可在 AP 运行期间使用
-    WiFi.disconnect(true);
-    WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_AP_STA);
-    delay(200);
-    esp_wifi_set_ps(WIFI_PS_NONE);   // 关闭省电，确保 beacon 持续广播
-    bool apOk = WiFi.softAP(apSSID, nullptr, 6);  // 指定 ch6，避免信道扫描遗漏
-    {
-        int8_t txp = cfg.wifi_tx_power;
-        if (txp == 0) txp = 15;  // ESP32-C3 天线缺陷+LDO不足，默认限制 15dBm
-        if (txp > 0) esp_wifi_set_max_tx_power((int8_t)(txp * 4));
-    }
-    Serial.printf("[AP] softAP() = %s\n", apOk ? "OK" : "FAILED");
-    Serial.printf("\n[AP] SoftAP started — SSID: %s  IP: 192.168.4.1\n", apSSID);
-    Serial.println(F("[AP] Connect to the AP, then open http://192.168.4.1"));
-    Serial.printf("[AP] ap_full_config = %s\n", cfg.ap_full_config ? "true (all fields)" : "false (wifi+mac only)");
-
-    apServer.on("/",       HTTP_GET,  handleAPRoot);
-    apServer.on("/config", HTTP_GET,  handleAPConfig);
-    apServer.on("/scan",   HTTP_GET,  handleAPScan);
-    apServer.on("/save",   HTTP_POST, handleAPSave);
-    apServer.onNotFound([]() {
-        apServer.sendHeader("Location", "http://192.168.4.1/");
-        apServer.send(302, "text/plain", "");
-    });
-    apServer.begin();
-
-    // DNS 劫持：所有域名解析到本机，触发系统 captive portal 检测
-    dnsServer.start(53, "*", WiFi.softAPIP());
-
-    unsigned long lastBlink = 0;
-    bool ledOn = false;
-
-    while (true) {
-        dnsServer.processNextRequest();
-        apServer.handleClient();
-        checkRuntimeTriggers();   // 按键 10s 仍可触发 /reconfig → restart
-
-        // LED 500ms 慢闪（区别于串口 CLI 的 100ms 快闪）
-        if (millis() - lastBlink >= 500) {
-            ledOn = !ledOn;
-            digitalWrite(LED_PIN, ledOn ? LOW : HIGH);
-            lastBlink = millis();
-        }
-        yield();
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// checkSoftAPFlag：检测 /softap 标志，有则进入 SoftAP 配置模式
-// ─────────────────────────────────────────────────────────────────────────────
-void checkSoftAPFlag() {
-    if (!LittleFS.exists("/softap")) return;
-    LittleFS.remove("/softap");
-    Serial.println(F("[CFG] /softap flag → SoftAP mode"));
-    enterSoftAPMode();  // 永不返回
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -989,12 +831,12 @@ void checkBLEProvFlag() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // checkRuntimeTriggers：可在任意循环中调用，非阻塞
-//   串口输入 "config"  → 写 /reconfig，重启进入串口 CLI
-//   串口输入 "ap"      → 写 /softap，重启进入 SoftAP 模式
+//   串口输入 "config"  → 写 /reconfig，重启进入串口 CLI（隐藏恢复通道）
+//   串口输入 "ble"     → 写 /bleprov，重启进入 BLE 配网模式
 //   串口输入 "reboot"  → 直接重启
 //   串口输入 "show"    → 打印当前运行状态（不重启）
-//   按键按住 3s 松手   → 写 /softap，重启进入 SoftAP 模式（LED 双闪提示）
-//   按键按住 10s      → 写 /reconfig，重启进入串口 CLI（配置保留，LED 五闪确认）
+//   按键按住 3s 松手   → 写 /bleprov，重启进入 BLE 配网（配置保留，LED 双闪提示）
+//   按键按住 10s      → 工厂重置（清空配置）后进入 BLE 配网（LED 五闪确认）
 // ─────────────────────────────────────────────────────────────────────────────
 void checkRuntimeTriggers() {
     // ── 串口输入检测 ──
@@ -1006,18 +848,6 @@ void checkRuntimeTriggers() {
             if (serialLineBuf == "config") {
                 Serial.println(F("[CFG] serial trigger → writing /reconfig, rebooting..."));
                 writeFlag("/reconfig");
-                delay(100);
-                ESP.restart();
-            } else if (serialLineBuf == "ap") {
-                if (!LittleFS.exists("/config.json")) {
-                    memset(&cfg, 0, sizeof(cfg));
-                    cfg.ap_full_config = true;
-                    cfg.mqtt_port = 8883;
-                    saveConfig();
-                    Serial.println(F("[CFG] no config.json → wrote minimal config with ap_full_config=true"));
-                }
-                writeFlag("/softap");
-                Serial.println(F("[CFG] serial trigger → writing /softap, rebooting into SoftAP..."));
                 delay(100);
                 ESP.restart();
             } else if (serialLineBuf == "ble") {
@@ -1065,13 +895,15 @@ void checkRuntimeTriggers() {
         btnPressing   = true;
         btnHit3s      = false;
         btnPressStart = millis();
-        Serial.println(F("[CFG] button held — 3s: SoftAP, 10s: serial CLI (config preserved)"));
+        Serial.println(F("[CFG] button held — 3s: BLE 配网, 10s: 工厂重置 + BLE 配网"));
 
     } else if (btnDown && btnPressing) {
         if (elapsed >= 10000) {
-            // 长按 10s：写 /reconfig 进串口 CLI（配置保留），LED 五闪确认
-            Serial.println(F("[CFG] 10s → /reconfig flag, rebooting into serial CLI..."));
-            writeFlag("/reconfig");
+            // 长按 10s：清空配置（工厂重置）后进 BLE 配网，LED 五闪确认
+            Serial.println(F("[CFG] 10s → factory reset, rebooting into BLE provisioning..."));
+            LittleFS.remove("/config.json");
+            LittleFS.remove("/wifi_networks.json");
+            writeFlag("/bleprov");
             for (int i = 0; i < 10; i++) {
                 digitalWrite(LED_PIN, i % 2 == 0 ? LOW : HIGH);
                 delay(100);
@@ -1079,9 +911,9 @@ void checkRuntimeTriggers() {
             digitalWrite(LED_PIN, HIGH);
             ESP.restart();
         } else if (elapsed >= 3000 && !btnHit3s) {
-            // 刚跨过 3s 阈值：LED 双闪提示可松手进 SoftAP
+            // 刚跨过 3s 阈值：LED 双闪提示可松手进 BLE 配网
             btnHit3s = true;
-            Serial.println(F("[CFG] release for SoftAP, keep 10s for serial CLI"));
+            Serial.println(F("[CFG] release for BLE provisioning, keep 10s for factory reset"));
             for (int i = 0; i < 4; i++) {
                 digitalWrite(LED_PIN, i % 2 == 0 ? LOW : HIGH);
                 delay(100);
@@ -1093,9 +925,9 @@ void checkRuntimeTriggers() {
         // 松手
         btnPressing = false;
         if (btnHit3s) {
-            // 松手在 3-10s 之间：写 /softap 标志，重启进 SoftAP 模式
-            Serial.println(F("[CFG] 3s release → /softap flag, rebooting into SoftAP..."));
-            writeFlag("/softap");
+            // 松手在 3-10s 之间：写 /bleprov 标志，重启进 BLE 配网模式
+            Serial.println(F("[CFG] 3s release → /bleprov flag, rebooting into BLE provisioning..."));
+            writeFlag("/bleprov");
             for (int i = 0; i < 4; i++) {
                 digitalWrite(LED_PIN, i % 2 == 0 ? LOW : HIGH);
                 delay(150);
@@ -1735,11 +1567,11 @@ static const char* wifiStatusName(int s) {
 
 // connectWiFiMulti：轮试历史 WiFi 列表，连上后把成功的网络移至列表头部。
 // 连接前先扫描,优先尝试当前可见网络。
-// 全部失败时：首次连接进配置模式，曾经连上过则重启（SDK 下次启动自动重试）。
+// 全部失败时：首次连接进 BLE 配网，曾经连上过则重启（SDK 下次启动自动重试）。
 void connectWiFiMulti() {
     if (wifiCount == 0) {
-        Serial.println(F("[WiFi] no networks in history → config mode"));
-        enterConfigMode();  // 永不返回
+        Serial.println(F("[WiFi] no networks in history → BLE provisioning"));
+        enterBLEProvMode();  // 永不返回
     }
 
     WiFi.mode(WIFI_STA);
@@ -1833,8 +1665,8 @@ void connectWiFiMulti() {
     // ── 全部失败 ─────────────────────────────────────────────────────────────
     Serial.println(F("[WiFi] all networks failed"));
     if (!cfg.wifi_ever_ok) {
-        Serial.println(F("[WiFi] first run → config mode"));
-        enterConfigMode();  // 永不返回
+        Serial.println(F("[WiFi] first run → BLE provisioning"));
+        enterBLEProvMode();  // 永不返回
     } else {
         Serial.println(F("[WiFi] → restart"));
         ESP.restart();
@@ -1934,19 +1766,16 @@ void setup() {
     // ── 2b. 加载 WiFi 历史列表（依赖 cfg.wifi_ssid 做迁移，必须在 loadConfig 之后）──
     bool hasWifi = loadWifiNetworks();
 
-    // ── 3. 重配置标志检测 → 串口 CLI ──
+    // ── 3. 重配置标志检测 → 串口 CLI（隐藏恢复通道）──
     checkReconfigFlag();
 
-    // ── 4. SoftAP 标志检测 → SoftAP 网页配置 ──
-    checkSoftAPFlag();
-
-    // ── 4b. BLE 配网标志检测 → NimBLE GATT 配网 ──
+    // ── 4. BLE 配网标志检测 → NimBLE GATT 配网 ──
     checkBLEProvFlag();
 
-    // ── 5. 配置校验：无有效配置 → 串口 CLI ──
+    // ── 5. 配置校验：无有效配置 → BLE 配网 ──
     if (!configOk || !hasWifi) {
-        Serial.println(F("[CFG] no valid config → config mode"));
-        enterConfigMode();  // 永不返回
+        Serial.println(F("[CFG] no valid config → BLE provisioning"));
+        enterBLEProvMode();  // 永不返回
     }
 
     // ── 6. 填充运行时主题 ──
