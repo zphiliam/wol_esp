@@ -109,7 +109,7 @@ unsigned long wifiConnectMs = 0;   // WiFi 首次连接耗时（ms），写入 o
 String        serialLineBuf;           // 串口输入行缓冲
 unsigned long btnPressStart = 0;       // 按键按下时刻
 bool          btnPressing   = false;   // 按键是否持续按住中
-bool          btnHit3s      = false;   // 已达 3s 阈值（松手触发 WiFi 重置）
+bool          btnHit3s      = false;   // 已达 3s 阈值（松手触发 BLE 配网）
 
 // ── LED 非阻塞闪烁状态 ────────────────────────────────────────────────────────
 struct BlinkJob {
@@ -774,6 +774,7 @@ void enterBLEProvMode() {
     adv->enableScanResponse(true);
     adv->start();
     Serial.println(F("[BLE] advertising started, waiting for client..."));
+    Serial.println(F("[BLE] serial recovery: type 'config' for serial CLI"));
 
     unsigned long startMs   = millis();
     unsigned long lastBlink = 0;
@@ -782,6 +783,29 @@ void enterBLEProvMode() {
 
     while (true) {
         yield();
+
+        // 串口恢复通道：BLE 配网模式下仍可输入 config 进串口 CLI（隐藏恢复通道）。
+        // 无有效配置时设备直接进本模式，串口是离开此模式的唯一兜底入口。
+        while (Serial.available()) {
+            char c = (char)Serial.read();
+            if (c == '\r') continue;
+            if (c == '\n') {
+                serialLineBuf.trim();
+                if (serialLineBuf == "config") {
+                    Serial.println(F("[BLE] serial → /reconfig, rebooting into serial CLI..."));
+                    writeFlag("/reconfig");
+                    delay(100);
+                    ESP.restart();
+                } else if (serialLineBuf == "reboot") {
+                    Serial.println(F("[BLE] serial → rebooting..."));
+                    delay(100);
+                    ESP.restart();
+                }
+                serialLineBuf = "";
+            } else if (serialLineBuf.length() < 128) {
+                serialLineBuf += c;
+            }
+        }
 
         // LED 500ms 慢闪提示配网模式
         if (millis() - lastBlink >= 500) {
