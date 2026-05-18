@@ -2,18 +2,20 @@
 <!--
   WoL ESP32-C3 — BLE 配网测试页（Web Bluetooth）
 
-  用途：测试固件阶段 1 的明文 BLE 配网 GATT 服务，自动处理分片协议。
+  用途：测试固件阶段 2 的加密 BLE 配网，自动处理 X25519 握手、AES-GCM 加密与分片。
   也可作为微信小程序 BLE 配网逻辑的参考实现。
 
   使用方法（需安全上下文，file:// 打不开）：
     cd test && python3 -m http.server 8000
     Chrome 打开 http://localhost:8000/ble_test.html
-  支持平台：桌面版 / Android 版 Chrome、Edge（iOS Safari 不支持 Web Bluetooth）。
+  支持平台：桌面/安卓版 Chrome、Edge（需支持 Web Crypto X25519，Chrome 133+）。
 
   GATT（详见 docs/BLE_REDESIGN.md）：
-    service e0c1a700  command(写) status(读+通知) scan(读+通知) config(写)
+    service e0c1a700  command status scan config handshake
     分片头 4 字节 [总长 LE:2][序号:1][标志:1]，标志 bit0=末片
-    status 通知为纯文本（不分片）；scan 通知与 config 写入走分片协议
+    握手：客户端写 32B X25519 公钥 → 设备回传 32B 公钥（handshake 特征）
+    session_key = HMAC-SHA256(PSK, shared‖"wol-ble-v1")
+    config 载荷 = iv(12)‖tag(16)‖密文，AES-256-GCM 加密后再走分片
 -->
 <html lang="zh-CN">
 <head>
@@ -58,14 +60,19 @@
 <body>
 
 <h1>WoL ESP32-C3 — BLE 配网测试</h1>
-<div class="sub">Web Bluetooth · 自动分片 · 阶段 1（明文 GATT）</div>
+<div class="sub">Web Bluetooth · X25519 + AES-256-GCM · 阶段 2（加密 GATT）</div>
 
 <div class="panel">
   <h2><span id="dot" class="dot"></span><span id="connState">未连接</span></h2>
-  <button id="btnConnect">连接设备</button>
-  <button id="btnDisconnect" class="ghost" disabled>断开</button>
-  <button id="btnScan" class="ghost" disabled>扫描 WiFi</button>
-  <button id="btnReboot" class="ghost" disabled>重启设备</button>
+  <label>设备 PSK（32 位十六进制，设备 BLE 模式串口日志打印）</label>
+  <input id="psk" placeholder="如 a1b2c3d4e5f60718...（16 字节 / 32 hex）" maxlength="50">
+  <div style="margin-top:10px">
+    <button id="btnConnect">连接设备</button>
+    <button id="btnHandshake" class="ghost" disabled>握手</button>
+    <button id="btnDisconnect" class="ghost" disabled>断开</button>
+    <button id="btnScan" class="ghost" disabled>扫描 WiFi</button>
+    <button id="btnReboot" class="ghost" disabled>重启设备</button>
+  </div>
 </div>
 
 <div class="panel">
@@ -111,12 +118,15 @@ const CMD    = 'e0c1a701-2b3a-4f5c-9d7e-1a2b3c4d5e6f';
 const STATUS = 'e0c1a702-2b3a-4f5c-9d7e-1a2b3c4d5e6f';
 const SCAN   = 'e0c1a703-2b3a-4f5c-9d7e-1a2b3c4d5e6f';
 const CFG    = 'e0c1a704-2b3a-4f5c-9d7e-1a2b3c4d5e6f';
+const HS     = 'e0c1a705-2b3a-4f5c-9d7e-1a2b3c4d5e6f';
 
 const FRAG_HEADER = 4;     // 分片头字节数
 const FRAG_CHUNK  = 180;   // 每片 payload 上限（与固件 BLE_FRAG_CHUNK 一致）
 
-let device, chCmd, chCfg;
-let scanRx = null;         // scan 分片重组缓冲 { total, buf:[] }
+let device, chCmd, chCfg, chHs;
+let scanRx     = null;     // scan 分片重组缓冲 { total, buf:[] }
+let sessionKey = null;     // 握手后派生的 AES-GCM CryptoKey
+let hsResolve  = null;     // 等待设备公钥通知的 Promise resolver
 
 const $ = id => document.getElementById(id);
 const enc = new TextEncoder(), dec = new TextDecoder();
@@ -135,7 +145,8 @@ function setConnected(on) {
   $('dot').classList.toggle('on', on);
   $('connState').textContent = on ? `已连接 ${device?.name || ''}` : '未连接';
   $('btnConnect').disabled = on;
-  ['btnDisconnect','btnScan','btnReboot','btnSave'].forEach(id => $(id).disabled = !on);
+  ['btnDisconnect','btnHandshake','btnScan','btnReboot'].forEach(id => $(id).disabled = !on);
+  if (!on) { $('btnSave').disabled = true; sessionKey = null; }   // btnSave 待握手后才启用
 }
 
 // ── 连接 ─────────────────────────────────────────────────────────────────────
@@ -162,8 +173,18 @@ async function connect() {
     await chScan.startNotifications();
     chScan.addEventListener('characteristicvaluechanged', e => onScanFragment(e.target.value));
 
+    chHs = await svc.getCharacteristic(HS);
+    await chHs.startNotifications();
+    chHs.addEventListener('characteristicvaluechanged', e => {
+      const dv = e.target.value;
+      const devPub = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+      if (hsResolve) { hsResolve(devPub); hsResolve = null; }
+    });
+
     setConnected(true);
-    log('连接成功，4 个特征就绪', 'log-ok');
+    log('连接成功，5 个特征就绪', 'log-ok');
+    if (parsePsk()) doHandshake();          // PSK 已填则自动握手
+    else log('请填入设备 PSK 后点「握手」', 'log-mut');
   } catch (err) {
     log('连接失败：' + err.message, 'log-err');
   }
@@ -220,6 +241,7 @@ async function writeFragmented(ch, bytes) {
 }
 
 async function save() {
+  if (!sessionKey) { log('请先完成握手再下发配置', 'log-err'); return; }
   const cfg = {
     ssid:   $('ssid').value.trim(),
     wpass:  $('wpass').value,
@@ -234,10 +256,71 @@ async function save() {
     cfg.mqttid   = $('mqttid').value.trim();
   }
   try {
-    await writeFragmented(chCfg, enc.encode(JSON.stringify(cfg)));
-    log('等待设备校验，结果见 status 通知…', 'log-mut');
+    // AES-256-GCM 加密；Web Crypto 输出为 密文‖tag(16)，重排为 iv‖tag‖密文
+    const plain = enc.encode(JSON.stringify(cfg));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ctTag = new Uint8Array(
+      await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, sessionKey, plain));
+    const tag = ctTag.slice(ctTag.length - 16);
+    const ct  = ctTag.slice(0, ctTag.length - 16);
+    const payload = new Uint8Array(12 + 16 + ct.length);
+    payload.set(iv, 0); payload.set(tag, 12); payload.set(ct, 28);
+    log(`config ▶ 明文 ${plain.length}B → 加密载荷 ${payload.length}B`, 'log-mut');
+    await writeFragmented(chCfg, payload);
+    log('等待设备解密校验，结果见 status 通知…', 'log-mut');
   } catch (err) {
     log('下发失败：' + err.message, 'log-err');
+  }
+}
+
+// ── X25519 握手 + 会话密钥派生 ────────────────────────────────────────────────
+function parsePsk() {
+  const hex = $('psk').value.replace(/[^0-9a-fA-F]/g, '');
+  if (hex.length !== 32) return null;
+  const b = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) b[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return b;
+}
+
+async function doHandshake() {
+  const psk = parsePsk();
+  if (!psk) { log('PSK 必须是 32 位十六进制字符', 'log-err'); return; }
+  try {
+    // 1. 生成临时 X25519 密钥对，导出客户端公钥
+    const kp = await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']);
+    const clientPub = new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey));
+
+    // 2. 写客户端公钥，等待设备公钥通知（5s 超时）
+    const devPubP = new Promise((res, rej) => {
+      hsResolve = res;
+      setTimeout(() => { if (hsResolve) { hsResolve = null; rej(new Error('握手超时')); } }, 5000);
+    });
+    await chHs.writeValueWithResponse(clientPub);
+    log('handshake ▶ 已发送客户端公钥 32 字节', 'log-ok');
+    const devPub = await devPubP;
+    log('handshake ◀ 收到设备公钥 32 字节', 'log-rx');
+
+    // 3. ECDH 算共享密钥
+    const devKey = await crypto.subtle.importKey('raw', devPub, { name: 'X25519' }, false, []);
+    const shared = new Uint8Array(
+      await crypto.subtle.deriveBits({ name: 'X25519', public: devKey }, kp.privateKey, 256));
+
+    // 4. session_key = HMAC-SHA256(PSK, shared ‖ "wol-ble-v1")
+    const label = enc.encode('wol-ble-v1');
+    const msg = new Uint8Array(shared.length + label.length);
+    msg.set(shared, 0); msg.set(label, shared.length);
+    const hmacKey = await crypto.subtle.importKey(
+      'raw', psk, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const skBytes = new Uint8Array(await crypto.subtle.sign('HMAC', hmacKey, msg));
+    sessionKey = await crypto.subtle.importKey(
+      'raw', skBytes, { name: 'AES-GCM' }, false, ['encrypt']);
+
+    $('btnSave').disabled = false;
+    log('握手完成，会话密钥已建立 ✓', 'log-ok');
+  } catch (err) {
+    sessionKey = null;
+    $('btnSave').disabled = true;
+    log('握手失败：' + err.message, 'log-err');
   }
 }
 
@@ -277,6 +360,7 @@ function parseCommands() {
 // ── 事件绑定 ─────────────────────────────────────────────────────────────────
 $('btnParse').onclick      = parseCommands;
 $('btnConnect').onclick    = connect;
+$('btnHandshake').onclick  = doHandshake;
 $('btnDisconnect').onclick = () => device?.gatt.disconnect();
 $('btnScan').onclick       = () => sendCmd('scan');
 $('btnReboot').onclick     = () => sendCmd('reboot');

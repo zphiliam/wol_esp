@@ -50,6 +50,12 @@
 // ── BLE 配网（NimBLE-Arduino） ────────────────────────────────────────────────
 #include <NimBLEDevice.h>
 
+// ── BLE 配网加密（mbedtls，ESP32 内置） ───────────────────────────────────────
+#include <esp_random.h>
+#include <mbedtls/ecdh.h>
+#include <mbedtls/gcm.h>
+#include <mbedtls/md.h>
+
 #include "esp_wifi.h"   // esp_wifi_set_max_tx_power()
 
 // ── 硬件 ──────────────────────────────────────────────────────────────────────
@@ -588,11 +594,13 @@ String applyAndSaveConfig(const String& ssidIn, const String& wpass, const Strin
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// BLE 配网模式（阶段 1：明文 GATT + 分片协议）
-//   GATT 服务含 4 个特征：command(写) / status(读+通知) / scan(读+通知) / config(写)
+// BLE 配网模式（阶段 2：X25519 + AES-256-GCM 加密 GATT + 分片协议）
+//   GATT 5 特征：command(写) status(读+通知) scan(读+通知) config(写) handshake(写+通知)
 //   分片协议：每片头 4 字节 [总长 LE:2][序号:1][标志:1]，标志 bit0=末片
-//   流程：BLE 连接 → 写 "scan" 触发扫描(分片下发) → 写 config JSON(分片上传)
-//         → 设备校验落盘 → 重启生效
+//   安全：客户端写 32B X25519 公钥 → 设备 ECDH 算共享密钥 →
+//         session_key = HMAC-SHA256(PSK, shared‖"wol-ble-v1") → 回传设备公钥
+//         config 载荷 = iv(12)‖tag(16)‖密文，AES-256-GCM；未握手拒收
+//   PSK：首次开机随机生成 16B 存 /ble_psk.bin（工厂重置不删），串口打印 hex
 //   详见 docs/BLE_REDESIGN.md
 // ═════════════════════════════════════════════════════════════════════════════
 #define BLE_SVC_UUID    "e0c1a700-2b3a-4f5c-9d7e-1a2b3c4d5e6f"
@@ -600,22 +608,89 @@ String applyAndSaveConfig(const String& ssidIn, const String& wpass, const Strin
 #define BLE_STATUS_UUID "e0c1a702-2b3a-4f5c-9d7e-1a2b3c4d5e6f"
 #define BLE_SCAN_UUID   "e0c1a703-2b3a-4f5c-9d7e-1a2b3c4d5e6f"
 #define BLE_CFG_UUID    "e0c1a704-2b3a-4f5c-9d7e-1a2b3c4d5e6f"
+#define BLE_HS_UUID     "e0c1a705-2b3a-4f5c-9d7e-1a2b3c4d5e6f"
 
 #define BLE_FRAG_HEADER   4       // 分片头字节数
 #define BLE_FRAG_CHUNK    180     // 分片 payload 上限（留足 MTU 余量）
-#define BLE_CFG_BUF_SIZE  1024    // 配置 JSON 重组缓冲上限
+#define BLE_CFG_BUF_SIZE  1024    // 配置载荷重组缓冲上限
 #define BLE_PROV_TIMEOUT  (5UL * 60 * 1000)  // 无连接超时（ms）
+#define BLE_PSK_LEN       16                 // per-device 预共享密钥字节数
+#define BLE_PSK_FILE      "/ble_psk.bin"
+#define BLE_GCM_IV_LEN    12      // AES-GCM 随机 IV 长度
+#define BLE_GCM_TAG_LEN   16      // AES-GCM 认证标签长度
 
 // ── BLE 回调与主循环共享状态（volatile：回调在 NimBLE 任务，主循环在另一任务） ──
 static volatile bool     bleClientConnected = false;
 static volatile bool     bleScanRequested   = false;
 static volatile bool     bleConfigReady     = false;
 static volatile bool     bleRebootRequested = false;
+static volatile bool     bleHandshakeReq    = false;   // 收到客户端公钥待处理
+static uint8_t           bleClientPub[32];             // 客户端 X25519 公钥
 static uint8_t           bleCfgBuf[BLE_CFG_BUF_SIZE];
 static volatile uint16_t bleCfgLen   = 0;   // 已累积字节数
 static volatile uint16_t bleCfgTotal = 0;   // 分片头声明的总字节数
 static NimBLECharacteristic* bleStatusChar = nullptr;
 static NimBLECharacteristic* bleScanChar   = nullptr;
+static NimBLECharacteristic* bleHsChar     = nullptr;
+
+// ── 加密状态 ──────────────────────────────────────────────────────────────────
+static uint8_t           blePsk[BLE_PSK_LEN];   // per-device 预共享密钥
+static uint8_t           bleSessionKey[32];     // 握手派生的 AES-256-GCM 会话密钥
+static volatile bool     bleSessionReady = false;   // 握手是否完成
+
+// mbedtls RNG 回调：转发到 ESP32 硬件随机数
+static int bleRng(void*, unsigned char* buf, size_t len) {
+    esp_fill_random(buf, len);
+    return 0;
+}
+
+// 加载 /ble_psk.bin；不存在则随机生成并持久化。PSK 是设备身份，工厂重置不删除。
+static void bleLoadOrCreatePsk() {
+    File f = LittleFS.open(BLE_PSK_FILE, "r");
+    if (f && f.size() == BLE_PSK_LEN) {
+        f.read(blePsk, BLE_PSK_LEN);
+        f.close();
+        return;
+    }
+    if (f) f.close();
+    esp_fill_random(blePsk, BLE_PSK_LEN);
+    File w = LittleFS.open(BLE_PSK_FILE, "w");
+    if (w) { w.write(blePsk, BLE_PSK_LEN); w.close(); }
+    Serial.println(F("[BLE] generated new per-device PSK"));
+}
+
+// session_key = HMAC-SHA256(key=PSK, msg = shared ‖ "wol-ble-v1")
+static void bleDeriveSessionKey(const uint8_t* shared, size_t sharedLen) {
+    static const char label[] = "wol-ble-v1";
+    const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, md, 1);   // 1 = 启用 HMAC
+    mbedtls_md_hmac_starts(&ctx, blePsk, BLE_PSK_LEN);
+    mbedtls_md_hmac_update(&ctx, shared, sharedLen);
+    mbedtls_md_hmac_update(&ctx, (const uint8_t*)label, sizeof(label) - 1);
+    mbedtls_md_hmac_finish(&ctx, bleSessionKey);
+    mbedtls_md_free(&ctx);
+}
+
+// AES-256-GCM 解密 config 载荷 iv(12)‖tag(16)‖密文 → 明文。
+// 返回明文长度；解密或验签失败返回 -1。
+static int bleDecryptConfig(const uint8_t* in, size_t inLen, uint8_t* out, size_t outCap) {
+    if (inLen < BLE_GCM_IV_LEN + BLE_GCM_TAG_LEN) return -1;
+    size_t ctLen = inLen - BLE_GCM_IV_LEN - BLE_GCM_TAG_LEN;
+    if (ctLen > outCap) return -1;
+    const uint8_t* iv  = in;
+    const uint8_t* tag = in + BLE_GCM_IV_LEN;
+    const uint8_t* ct  = in + BLE_GCM_IV_LEN + BLE_GCM_TAG_LEN;
+    mbedtls_gcm_context gcm;
+    mbedtls_gcm_init(&gcm);
+    int r = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, bleSessionKey, 256);
+    if (r == 0)
+        r = mbedtls_gcm_auth_decrypt(&gcm, ctLen, iv, BLE_GCM_IV_LEN,
+                                     nullptr, 0, tag, BLE_GCM_TAG_LEN, ct, out);
+    mbedtls_gcm_free(&gcm);
+    return (r == 0) ? (int)ctLen : -1;
+}
 
 // status 特征写入文本并通知（仅主循环调用）
 static void bleSetStatus(const char* s) {
@@ -675,6 +750,16 @@ class BleCfgCallbacks : public NimBLECharacteristicCallbacks {
     }
 };
 
+// handshake 特征：接收 32 字节客户端 X25519 公钥
+class BleHsCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* chr, NimBLEConnInfo&) override {
+        NimBLEAttValue v = chr->getValue();
+        if (v.length() != 32) return;
+        memcpy(bleClientPub, v.data(), 32);
+        bleHandshakeReq = true;
+    }
+};
+
 // 服务端连接回调：维护连接状态，断开后恢复广播
 class BleServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer*, NimBLEConnInfo&) override {
@@ -683,6 +768,7 @@ class BleServerCallbacks : public NimBLEServerCallbacks {
     }
     void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override {
         bleClientConnected = false;
+        bleSessionReady    = false;   // 会话密钥随连接失效，新客户端须重新握手
         Serial.println(F("[BLE] client disconnected, re-advertising"));
         NimBLEDevice::startAdvertising();
     }
@@ -705,12 +791,60 @@ static void bleDoScan() {
     bleNotifyFragmented(bleScanChar, (const uint8_t*)json.c_str(), json.length());
 }
 
-// 解析重组好的配置 JSON，校验落盘；成功则重启（不返回），失败经 status 回报
+// 处理握手：用收到的客户端公钥做 X25519 ECDH，派生会话密钥，回传设备公钥
+static void bleDoHandshake() {
+    uint8_t devPub[32], shared[32];
+    size_t  olen = 0;
+    bool    ok   = false;
+    mbedtls_ecdh_context ecdh;
+    mbedtls_ecdh_init(&ecdh);
+    do {
+        if (mbedtls_ecdh_setup(&ecdh, MBEDTLS_ECP_DP_CURVE25519) != 0) break;
+        if (mbedtls_ecdh_make_public(&ecdh, &olen, devPub, sizeof(devPub),
+                                     bleRng, nullptr) != 0 || olen != 32) break;
+        if (mbedtls_ecdh_read_public(&ecdh, bleClientPub, 32) != 0) break;
+        if (mbedtls_ecdh_calc_secret(&ecdh, &olen, shared, sizeof(shared),
+                                     bleRng, nullptr) != 0 || olen != 32) break;
+        ok = true;
+    } while (0);
+    mbedtls_ecdh_free(&ecdh);
+
+    if (!ok) {
+        Serial.println(F("[BLE] handshake (X25519) failed"));
+        bleSetStatus("error:密钥交换失败。");
+        return;
+    }
+    bleDeriveSessionKey(shared, 32);
+    bleSessionReady = true;
+    bleHsChar->setValue(devPub, 32);
+    bleHsChar->notify();
+    Serial.println(F("[BLE] handshake done, session key established"));
+    bleSetStatus("handshake_ok");
+}
+
+// 解密并解析配置载荷，校验落盘；成功则重启（不返回），失败经 status 回报
 static void bleProcessConfig() {
     bleConfigReady = false;
-    StaticJsonDocument<768> doc;
-    DeserializationError e = deserializeJson(doc, bleCfgBuf, bleCfgLen);
+    uint16_t encLen = bleCfgLen;
     bleCfgLen = 0;
+
+    if (!bleSessionReady) {
+        Serial.println(F("[BLE] config rejected: handshake not done"));
+        bleSetStatus("error:未完成密钥交换，拒收配置。");
+        return;
+    }
+
+    // 解密 iv(12)‖tag(16)‖密文 → 明文（验签失败即 PSK 不符或数据被篡改）
+    static uint8_t plain[BLE_CFG_BUF_SIZE];
+    int plainLen = bleDecryptConfig(bleCfgBuf, encLen, plain, sizeof(plain));
+    if (plainLen < 0) {
+        Serial.println(F("[BLE] config decrypt/auth failed"));
+        bleSetStatus("error:解密验签失败（PSK 不匹配或数据损坏）。");
+        return;
+    }
+
+    StaticJsonDocument<768> doc;
+    DeserializationError e = deserializeJson(doc, plain, plainLen);
     if (e) {
         Serial.printf("[BLE] config JSON parse error: %s\n", e.c_str());
         bleSetStatus("error:配置 JSON 解析失败。");
@@ -739,6 +873,13 @@ void enterBLEProvMode() {
     snprintf(devName, sizeof(devName), "WoL-%04X", (uint16_t)(ESP.getEfuseMac() & 0xFFFF));
     Serial.printf("\n[BLE] provisioning mode — device name: %s\n", devName);
 
+    // 加载/生成 per-device PSK，串口打印 hex（测试时录入客户端）
+    bleLoadOrCreatePsk();
+    Serial.print(F("[BLE] device PSK (hex): "));
+    for (int i = 0; i < BLE_PSK_LEN; i++) Serial.printf("%02x", blePsk[i]);
+    Serial.println();
+    bleSessionReady = false;
+
     // WiFi 置 STA 模式供扫描用；BLE 与 WiFi 在 ESP32-C3 上共存
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
@@ -765,6 +906,10 @@ void enterBLEProvMode() {
     NimBLECharacteristic* cfgChr =
         svc->createCharacteristic(BLE_CFG_UUID, NIMBLE_PROPERTY::WRITE);
     cfgChr->setCallbacks(new BleCfgCallbacks());
+
+    bleHsChar =
+        svc->createCharacteristic(BLE_HS_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
+    bleHsChar->setCallbacks(new BleHsCallbacks());
 
     svc->start();
 
@@ -827,6 +972,11 @@ void enterBLEProvMode() {
             Serial.println(F("[BLE] reboot requested by client"));
             delay(200);
             ESP.restart();
+        }
+
+        if (bleHandshakeReq) {
+            bleHandshakeReq = false;
+            bleDoHandshake();
         }
 
         if (bleScanRequested) {

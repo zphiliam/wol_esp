@@ -134,7 +134,23 @@ TLS + BLE GATT + ECDH 缓冲同时占用导致 OOM。
 
 ## 8. 分阶段实现
 
-1. **阶段 0**:移除 ESP8266 兼容代码,固件成为 ESP32-C3 独占(保持可编译)
-2. **阶段 1**:明文 GATT + 分片协议,用 nRF Connect 跑通「连接→扫描→写配置→重启」
-3. **阶段 2**:加 ECDH + AES-GCM + PSK 认证
+1. ~~**阶段 0**:移除 ESP8266 兼容代码,固件成为 ESP32-C3 独占~~ ✅
+2. ~~**阶段 1**:明文 GATT + 分片协议~~ ✅
+3. ~~**阶段 2**:X25519 ECDH + AES-256-GCM + per-device PSK~~ ✅
 4. **阶段 3**:微信小程序联调,完善 LED 反馈与超时兜底
+
+> 结构收尾(移除 SoftAP、按键改 BLE、首次开机自动进 BLE)已随阶段 1/2 完成。
+
+### 阶段 2 最终实现细节
+
+- **PSK**:首次开机随机生成 16B,存 `/ble_psk.bin`,工厂重置不删除;BLE 模式
+  启动时串口打印 hex。
+- **握手**:`handshake` 特征(`e0c1a705`),客户端写 32B X25519 公钥,设备
+  回传 32B 公钥(notify)。固件用 mbedtls ECDH(Curve25519/Everest),
+  网页用 Web Crypto `X25519`。
+- **会话密钥**:`HMAC-SHA256(key=PSK, msg=shared ‖ "wol-ble-v1")`,32B 即
+  AES-256 密钥。
+- **config 加密**:载荷 = `iv(12) ‖ tag(16) ‖ 密文`,AES-256-GCM,无 AAD;
+  Web Crypto 输出为 `密文‖tag`,客户端需重排为 `iv‖tag‖密文`。
+- 设备未完成握手时拒收 config;解密验签失败回 `error:` 状态。
+- `scan` / `status` 仍为明文(SSID、状态文本非敏感)。
