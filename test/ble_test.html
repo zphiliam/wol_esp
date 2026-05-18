@@ -103,7 +103,8 @@ set mqtt_port 8883"></textarea>
     <div><label>MQTT 用户名</label><input id="mqttuser"></div>
     <div><label>MQTT 密码</label><input id="mqttpass" type="text"></div>
   </div>
-  <label>MQTT Client ID</label><input id="mqttid">
+  <p class="log-mut" style="font-size:12px;margin:8px 0 0">
+    MQTT Client ID 由设备芯片 ID 自动生成,无需填写。</p>
   <div style="margin-top:12px"><button id="btnSave" disabled>下发配置并重启</button></div>
 </div>
 
@@ -253,7 +254,6 @@ async function save() {
     cfg.mqttport = parseInt($('mqttport').value) || 8883;
     cfg.mqttuser = $('mqttuser').value.trim();
     cfg.mqttpass = $('mqttpass').value;
-    cfg.mqttid   = $('mqttid').value.trim();
   }
   try {
     // AES-256-GCM 加密；Web Crypto 输出为 密文‖tag(16)，重排为 iv‖tag‖密文
@@ -338,7 +338,7 @@ async function sendCmd(text) {
 const KEYMAP = {
   wifi_ssid:  'ssid',     wifi_pass: 'wpass',    wol_mac:   'wolmac',
   mqtt_server:'mqttsvr',  mqtt_port: 'mqttport', mqtt_user: 'mqttuser',
-  mqtt_pass:  'mqttpass', mqtt_id:   'mqttid',
+  mqtt_pass:  'mqttpass',
 };
 
 function parseCommands() {

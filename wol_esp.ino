@@ -136,7 +136,6 @@ bool saveConfig() {
     doc["mqtt_port"]    = cfg.mqtt_port;
     doc["mqtt_user"]    = cfg.mqtt_user;
     doc["mqtt_pass"]    = cfg.mqtt_pass;
-    doc["mqtt_id"]      = cfg.mqtt_id;
     doc["wol_mac"]       = cfg.wol_mac;
     doc["wifi_ever_ok"]  = cfg.wifi_ever_ok;
     doc["wifi_tx_power"]   = cfg.wifi_tx_power;
@@ -163,16 +162,27 @@ bool loadConfig() {
     cfg.mqtt_port = doc["mqtt_port"] | 8883;
     strlcpy(cfg.mqtt_user,   doc["mqtt_user"]    | "", sizeof(cfg.mqtt_user));
     strlcpy(cfg.mqtt_pass,   doc["mqtt_pass"]    | "", sizeof(cfg.mqtt_pass));
-    strlcpy(cfg.mqtt_id,     doc["mqtt_id"]      | "", sizeof(cfg.mqtt_id));
     strlcpy(cfg.wol_mac,     doc["wol_mac"]      | "", sizeof(cfg.wol_mac));
     cfg.wifi_ever_ok   = doc["wifi_ever_ok"]   | false;
     // 默认值：ESP32-C3 SuperMini 天线设计缺陷+LDO电流不足，15dBm 最稳定（ESP3D 实测推荐）
     cfg.wifi_tx_power  = doc["wifi_tx_power"]  | 15;
 
-    // 必填项校验（wifi_ssid 已迁移至 wifi_networks.json，此处不再要求）
+    // 必填项校验（wifi_ssid 已迁移至 wifi_networks.json；mqtt_id 由芯片 ID 派生，均不要求）
     return strlen(cfg.mqtt_server) > 0
-        && strlen(cfg.mqtt_id)     > 0
         && strlen(cfg.wol_mac)     == 12;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 设备身份：mqtt_id 与 BLE PSK
+// ─────────────────────────────────────────────────────────────────────────────
+#define BLE_PSK_LEN   16
+#define BLE_PSK_FILE  "/ble_psk.bin"
+static uint8_t blePsk[BLE_PSK_LEN];   // per-device PSK（设备身份，工厂重置不删）
+
+// mqtt_id 由芯片 eFuse MAC 派生：全局唯一、重启稳定，无需用户配置。
+// 同时用作 MQTT client ID 与主题中的设备标识。
+static void genMqttId(char* buf, size_t len) {
+    snprintf(buf, len, "wol-%012llx", (unsigned long long)ESP.getEfuseMac());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -350,9 +360,9 @@ static void printConfigHelp() {
     Serial.println(F("  set mqtt_port   <value>  (default 8883)"));
     Serial.println(F("  set mqtt_user   <value>"));
     Serial.println(F("  set mqtt_pass   <value>"));
-    Serial.println(F("  set mqtt_id     <value>"));
     Serial.println(F("  set wol_mac        <value>  (12 hex chars, no separators)"));
     Serial.println(F("  set wifi_tx_power  <2-20|0>      (dBm; 0=platform default; ESP32-C3 推荐 15)"));
+    Serial.println(F("  id     - show device mqtt_id and BLE PSK"));
     Serial.println(F("  show   - display staged config"));
     Serial.println(F("  save   - write to flash and reboot"));
     Serial.println(F("  ble    - write /bleprov flag and reboot into BLE provisioning"));
@@ -407,11 +417,20 @@ void enterConfigMode() {
                 Serial.printf("  server    : %s:%u\n", staged.mqtt_server, staged.mqtt_port);
                 Serial.printf("  user      : %s\n",    staged.mqtt_user);
                 Serial.printf("  pass      : %s\n",    strlen(staged.mqtt_pass) ? "(set)" : "(not set)");
-                Serial.printf("  id        : %s\n",    staged.mqtt_id);
                 Serial.println(F("[Device]"));
+                Serial.printf("  mqtt_id   : %s\n",  cfg.mqtt_id);
                 Serial.printf("  wol_mac   : %s\n",  staged.wol_mac);
                 Serial.printf("  tx_power  : %ddBm%s\n", staged.wifi_tx_power, staged.wifi_tx_power == 0 ? " (default)" : "");
                 Serial.println(F("---------------------------"));
+
+            } else if (line == "id") {
+                // 读取设备身份：mqtt_id（芯片派生）与 BLE PSK（用于贴二维码 / 服务端配置）
+                Serial.println(F("------ device identity ------"));
+                Serial.printf("  mqtt_id : %s\n", cfg.mqtt_id);
+                Serial.print(F("  ble_psk : "));
+                for (int i = 0; i < BLE_PSK_LEN; i++) Serial.printf("%02x", blePsk[i]);
+                Serial.println();
+                Serial.println(F("-----------------------------"));
 
             } else if (line == "wifi list") {
                 if (wifiCount == 0) {
@@ -436,7 +455,6 @@ void enterConfigMode() {
                 bool ok = true;
                 if (wifiCount == 0 && !explicitSsid) { Serial.println(F("[CFG] error: wifi_ssid required (or use 'wifi list' to check history)")); ok = false; }
                 if (staged.mqtt_server[0] == '\0') { Serial.println(F("[CFG] error: mqtt_server required")); ok = false; }
-                if (staged.mqtt_id[0]     == '\0') { Serial.println(F("[CFG] error: mqtt_id required"));     ok = false; }
                 { bool hexOk = (strlen(staged.wol_mac) == 12);
                   for (int i = 0; hexOk && i < 12; i++) hexOk = isxdigit((unsigned char)staged.wol_mac[i]);
                   if (!hexOk) { Serial.println(F("[CFG] error: wol_mac must be 12 hex chars")); ok = false; } }
@@ -504,7 +522,6 @@ void enterConfigMode() {
                     else if (key == "mqtt_server") strlcpy(staged.mqtt_server, val.c_str(), sizeof(staged.mqtt_server));
                     else if (key == "mqtt_user")   strlcpy(staged.mqtt_user,   val.c_str(), sizeof(staged.mqtt_user));
                     else if (key == "mqtt_pass")   strlcpy(staged.mqtt_pass,   val.c_str(), sizeof(staged.mqtt_pass));
-                    else if (key == "mqtt_id")     strlcpy(staged.mqtt_id,     val.c_str(), sizeof(staged.mqtt_id));
                     else if (key == "mqtt_port") {
                         int p = val.toInt();
                         if (p > 0 && p <= 65535) staged.mqtt_port = (uint16_t)p;
@@ -558,20 +575,16 @@ void checkReconfigFlag() {
 // ─────────────────────────────────────────────────────────────────────────────
 String applyAndSaveConfig(const String& ssidIn, const String& wpass, const String& wolmacIn,
                           bool withMqtt, const String& mqttsvrIn, int mqttport,
-                          const String& mqttuser, const String& mqttpass, const String& mqttidIn) {
+                          const String& mqttuser, const String& mqttpass) {
     String ssid   = ssidIn;   ssid.trim();
     String wolmac = wolmacIn; wolmac.trim();
     String mqttsvr = mqttsvrIn; mqttsvr.trim();
-    String mqttid  = mqttidIn;  mqttid.trim();
 
     if (ssid.length() == 0)   return "WiFi SSID 不能为空。";
     if (wolmac.length() != 12) return "WoL MAC 地址必须是 12 位十六进制字符（无分隔符）。";
     for (int i = 0; i < 12; i++)
         if (!isxdigit((unsigned char)wolmac[i])) return "WoL MAC 地址包含非十六进制字符。";
-    if (withMqtt) {
-        if (mqttsvr.length() == 0) return "MQTT 服务器地址不能为空。";
-        if (mqttid.length()  == 0) return "MQTT Client ID 不能为空。";
-    }
+    if (withMqtt && mqttsvr.length() == 0) return "MQTT 服务器地址不能为空。";
 
     // 写入 cfg 并更新 WiFi 历史列表
     lruAddOrUpdate(ssid.c_str(), wpass.c_str());
@@ -586,7 +599,6 @@ String applyAndSaveConfig(const String& ssidIn, const String& wpass, const Strin
         cfg.mqtt_port = (mqttport > 0 && mqttport <= 65535) ? (uint16_t)mqttport : 8883;
         strlcpy(cfg.mqtt_user, mqttuser.c_str(), sizeof(cfg.mqtt_user));
         strlcpy(cfg.mqtt_pass, mqttpass.c_str(), sizeof(cfg.mqtt_pass));
-        strlcpy(cfg.mqtt_id,   mqttid.c_str(),   sizeof(cfg.mqtt_id));
     }
 
     if (!saveConfig()) return "配置写入 LittleFS 失败。";
@@ -614,8 +626,6 @@ String applyAndSaveConfig(const String& ssidIn, const String& wpass, const Strin
 #define BLE_FRAG_CHUNK    180     // 分片 payload 上限（留足 MTU 余量）
 #define BLE_CFG_BUF_SIZE  1024    // 配置载荷重组缓冲上限
 #define BLE_PROV_TIMEOUT  (5UL * 60 * 1000)  // 配网模式超时（ms，仅对已配置设备生效）
-#define BLE_PSK_LEN       16                 // per-device 预共享密钥字节数
-#define BLE_PSK_FILE      "/ble_psk.bin"
 #define BLE_GCM_IV_LEN    12      // AES-GCM 随机 IV 长度
 #define BLE_GCM_TAG_LEN   16      // AES-GCM 认证标签长度
 
@@ -633,8 +643,7 @@ static NimBLECharacteristic* bleStatusChar = nullptr;
 static NimBLECharacteristic* bleScanChar   = nullptr;
 static NimBLECharacteristic* bleHsChar     = nullptr;
 
-// ── 加密状态 ──────────────────────────────────────────────────────────────────
-static uint8_t           blePsk[BLE_PSK_LEN];   // per-device 预共享密钥
+// ── 加密状态（blePsk 声明见前「设备身份」一节） ───────────────────────────────
 static uint8_t           bleSessionKey[32];     // 握手派生的 AES-256-GCM 会话密钥
 static volatile bool     bleSessionReady = false;   // 握手是否完成
 
@@ -855,7 +864,7 @@ static void bleProcessConfig() {
     String err = applyAndSaveConfig(
         doc["ssid"] | "", doc["wpass"] | "", doc["wolmac"] | "",
         withMqtt, mqttsvr, doc["mqttport"] | 8883,
-        doc["mqttuser"] | "", doc["mqttpass"] | "", doc["mqttid"] | "");
+        doc["mqttuser"] | "", doc["mqttpass"] | "");
     if (err.length() > 0) {
         bleSetStatus((String("error:") + err).c_str());
         return;
@@ -874,8 +883,8 @@ void enterBLEProvMode() {
     snprintf(devName, sizeof(devName), "WoL-%04X", (uint16_t)(ESP.getEfuseMac() & 0xFFFF));
     Serial.printf("\n[BLE] provisioning mode — device name: %s\n", devName);
 
-    // 加载/生成 per-device PSK，串口打印 hex（测试时录入客户端）
-    bleLoadOrCreatePsk();
+    // mqtt_id 与 PSK 已在 setup 中派生/加载，此处打印供测试与贴二维码使用
+    Serial.printf("[BLE] device mqtt_id: %s\n", cfg.mqtt_id);
     Serial.print(F("[BLE] device PSK (hex): "));
     for (int i = 0; i < BLE_PSK_LEN; i++) Serial.printf("%02x", blePsk[i]);
     Serial.println();
@@ -1477,16 +1486,15 @@ void doSpeedtest(const char* urlParam, int maxSeconds) {
 //   重启原因：保证 TLS 状态干净、mqttEverConnected 复位、新 broker 收到 online 事件
 // ─────────────────────────────────────────────────────────────────────────────
 void doSetMqtt(const char* newServer, uint16_t newPort,
-               const char* newUser,   const char* newPass, const char* newId) {
-    // 1. 用当前配置作基础，仅覆盖非空字段
+               const char* newUser,   const char* newPass) {
+    // 1. 用当前配置作基础，仅覆盖非空字段（mqtt_id 由芯片派生，不可变）
     char   testServer[64];  strlcpy(testServer, strlen(newServer) > 0 ? newServer : cfg.mqtt_server, sizeof(testServer));
     uint16_t testPort =     newPort > 0       ? newPort   : cfg.mqtt_port;
     char   testUser[64];    strlcpy(testUser,   strlen(newUser)   > 0 ? newUser   : cfg.mqtt_user,   sizeof(testUser));
     char   testPass[64];    strlcpy(testPass,   strlen(newPass)   > 0 ? newPass   : cfg.mqtt_pass,   sizeof(testPass));
-    char   testId[32];      strlcpy(testId,     strlen(newId)     > 0 ? newId     : cfg.mqtt_id,     sizeof(testId));
 
     Serial.printf("[SET_MQTT] testing → %s:%u  user=%s  id=%s\n",
-        testServer, testPort, testUser, testId);
+        testServer, testPort, testUser, cfg.mqtt_id);
 
     // 2. 断开当前 MQTT（释放 TLS 资源）
     // 失败时直接用 cfg.* 回退（cfg 在失败分支中未被修改）
@@ -1510,7 +1518,7 @@ void doSetMqtt(const char* newServer, uint16_t newPort,
         testMqtt.setSocketTimeout(10);  // 单次 TCP 超时 10s，避免长时间阻塞
 
         Serial.println(F("[SET_MQTT] connecting test client..."));
-        ok = testMqtt.connect(testId, testUser, testPass);
+        ok = testMqtt.connect(cfg.mqtt_id, testUser, testPass);
         testRc = testMqtt.state();
         if (ok) {
             testMqtt.disconnect();
@@ -1529,7 +1537,6 @@ void doSetMqtt(const char* newServer, uint16_t newPort,
         cfg.mqtt_port = testPort;
         strlcpy(cfg.mqtt_user, testUser, sizeof(cfg.mqtt_user));
         strlcpy(cfg.mqtt_pass, testPass, sizeof(cfg.mqtt_pass));
-        strlcpy(cfg.mqtt_id,   testId,   sizeof(cfg.mqtt_id));
         saveConfig();
         Serial.println(F("[SET_MQTT] config saved, rebooting"));
         ESP.restart();
@@ -1687,18 +1694,16 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
         uint16_t    newPort   = doc["port"]   | 0;
         const char* newUser   = doc["user"]   | "";
         const char* newPass   = doc["pass"]   | "";
-        const char* newId     = doc["id"]     | "";
 
         // 至少要有一个字段发生实质性变化
         bool anyChange = (strlen(newServer) > 0 && strcmp(newServer, cfg.mqtt_server) != 0)
                       || (newPort > 0            && newPort != cfg.mqtt_port)
                       || (strlen(newUser) > 0    && strcmp(newUser, cfg.mqtt_user) != 0)
-                      || (strlen(newPass) > 0    && strcmp(newPass, cfg.mqtt_pass) != 0)
-                      || (strlen(newId)   > 0    && strcmp(newId,   cfg.mqtt_id)   != 0);
+                      || (strlen(newPass) > 0    && strcmp(newPass, cfg.mqtt_pass) != 0);
         if (!anyChange) {
             pubEvent("error:set_mqtt_no_change");
         } else {
-            doSetMqtt(newServer, newPort, newUser, newPass, newId);
+            doSetMqtt(newServer, newPort, newUser, newPass);
         }
 
     // ── ota ──
@@ -1940,6 +1945,10 @@ void setup() {
 
     // ── 2b. 加载 WiFi 历史列表（依赖 cfg.wifi_ssid 做迁移，必须在 loadConfig 之后）──
     bool hasWifi = loadWifiNetworks();
+
+    // ── 2c. 设备身份：派生 mqtt_id、加载/生成 BLE PSK（须先于任何模式检测）──
+    genMqttId(cfg.mqtt_id, sizeof(cfg.mqtt_id));
+    bleLoadOrCreatePsk();
 
     // ── 3. 重配置标志检测 → 串口 CLI（隐藏恢复通道）──
     checkReconfigFlag();

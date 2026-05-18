@@ -45,12 +45,16 @@
 {
   "wifi_ssid": "...", "wifi_pass": "...",
   "mqtt_server": "...", "mqtt_port": 8883,
-  "mqtt_user": "...", "mqtt_pass": "...", "mqtt_id": "...",
+  "mqtt_user": "...", "mqtt_pass": "...",
   "wol_mac": "AABBCCDDEEFF",
   "wifi_ever_ok": false,
   "wifi_tx_power": 15
 }
 ```
+
+- `mqtt_id` 不在此文件中:由芯片 eFuse MAC 派生(`wol-<12位 MAC 十六进制>`),
+  开机时 `genMqttId()` 填充 `cfg.mqtt_id`,全局唯一、重启稳定,不可配置。
+- BLE PSK 存于独立文件 `/ble_psk.bin`(见 BLE 配网章节)。
 - `wifi_ssid` / `wifi_pass`：记录最近一次成功连接的网络，兼作降级兜底（若
   `/wifi_networks.json` 损坏可迁移回来）
 
@@ -91,34 +95,38 @@ setup()
 
 ## BLE 配网模式（enterBLEProvMode）
 
-阻塞式特殊模式，永不返回，完成后重启。LED 500ms 慢闪。
+阻塞式特殊模式，永不返回，完成后重启。LED 未连接 500ms 慢闪 / 已连接 150ms 快闪。
 
 - BLE 设备名：`WoL-XXXX`（XXXX = chip ID 末 4 位十六进制）
-- NimBLE GATT 服务（UUID `e0c1a700-…`），含 4 个特征：
+- NimBLE GATT 服务（UUID `e0c1a700-…`），含 5 个特征：
   - `command`（写）：文本指令 `scan` / `reboot`
   - `status`（读+通知）：状态文本（`idle` / `scanning` / `ok:rebooting` / `error:…`）
   - `scan`（读+通知）：WiFi 扫描结果 JSON，分片下发
-  - `config`（写）：配置 JSON，分片上传
+  - `config`（写）：加密配置载荷，分片上传
+  - `handshake`（写+通知）：X25519 公钥交换
 - 分片协议：每片头 4 字节 `[总长 LE:2][序号:1][标志:1]`，标志 bit0=末片
+- 加密：客户端写 32B X25519 公钥握手 → `session_key = HMAC-SHA256(PSK,
+  shared‖"wol-ble-v1")`；`config` 载荷 = `iv(12)‖tag(16)‖密文`，AES-256-GCM
 - 配置 JSON 字段：`ssid` `wpass` `wolmac` `mqttsvr` `mqttport` `mqttuser`
-  `mqttpass` `mqttid`；含 `mqttsvr` 时整套 MQTT 字段一并写入
+  `mqttpass`；含 `mqttsvr` 时整套 MQTT 字段一并写入（`mqtt_id` 自动派生，不传）
+- PSK：首次开机随机生成 16B 存 `/ble_psk.bin`（工厂重置不删），串口打印 hex
 - 校验落盘走公共函数 `applyAndSaveConfig()`，成功后重启
-- 5 分钟无连接 → 自动重启回正常运行（防按键误触卡死）
+- 超时回正常运行：仅对已有配置的设备生效（无配置设备常驻配网）
 - 完整协议见 `docs/BLE_REDESIGN.md`
 
-阶段进度：阶段 1（明文 GATT）已完成；阶段 2（ECDH + AES-GCM + per-device PSK
-加密）待实现。
+阶段进度：阶段 0/1/2 + 固件收尾已完成；阶段 3（微信小程序）待启动。
 
 ## 串口配置模式（enterConfigMode）
 
 **隐藏恢复通道**，不对终端用户宣传，用于产线初配与变砖恢复。触发条件：`/reconfig`
 标志（由串口 `config` 命令写入）。LED 100ms 快闪。
 
-命令：`set <key> <value>` / `wifi list` / `wifi del <n>` / `show` / `save` /
+命令：`set <key> <value>` / `wifi list` / `wifi del <n>` / `id` / `show` / `save` /
 `ble` / `reset` / `reboot` / `help`
 
 - `save`：若 staged 中有 `wifi_ssid`，追加到历史列表头部；写入 LittleFS 并自动重启
 - `wifi list` / `wifi del <n>`：列出 / 删除历史 WiFi 网络
+- `id`：打印设备 `mqtt_id`（芯片派生）与 BLE PSK（hex），用于贴二维码 / 服务端配置
 - `ble`：切换到 BLE 配网模式
 - `reset`：清除 `config.json` 和 `wifi_networks.json` 并重启
 
