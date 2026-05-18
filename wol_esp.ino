@@ -46,6 +46,9 @@
 #include <HTTPClient.h>
 #include <Update.h>
 
+// ── BLE 配网（NimBLE-Arduino） ────────────────────────────────────────────────
+#include <NimBLEDevice.h>
+
 // ── WebServer + DNS（配置 AP 模式 / Captive Portal） ─────────────────────────
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -355,6 +358,7 @@ static void printConfigHelp() {
     Serial.println(F("  show   - display staged config"));
     Serial.println(F("  save   - write to flash and reboot"));
     Serial.println(F("  ap     - write /softap flag and reboot into SoftAP mode"));
+    Serial.println(F("  ble    - write /bleprov flag and reboot into BLE provisioning"));
     Serial.println(F("  reset  - erase config and reboot"));
     Serial.println(F("  reboot - reboot immediately"));
     Serial.println(F("  help   - show this help"));
@@ -475,6 +479,13 @@ void enterConfigMode() {
                 }
                 writeFlag("/softap");
                 Serial.println(F("[CFG] /softap flag written, rebooting into SoftAP..."));
+                digitalWrite(LED_PIN, HIGH);
+                delay(300);
+                ESP.restart();
+
+            } else if (line == "ble") {
+                writeFlag("/bleprov");
+                Serial.println(F("[CFG] /bleprov flag written, rebooting into BLE mode..."));
                 digitalWrite(LED_PIN, HIGH);
                 delay(300);
                 ESP.restart();
@@ -604,31 +615,52 @@ static void handleAPRoot() {
     apServer.send(200, "text/html", FPSTR(CONFIG_HTML));
 }
 
+// applyAndSaveConfig：校验并落盘一组配置字段，返回 ""=成功，否则为错误描述。
+// SoftAP 网页与 BLE 配网共用此函数,确保两条配网路径的校验与落盘逻辑一致。
+//   withMqtt=false 时只写 WiFi/MAC,不触碰 MQTT 字段(保留现有值)。
+String applyAndSaveConfig(const String& ssidIn, const String& wpass, const String& wolmacIn,
+                          bool withMqtt, const String& mqttsvrIn, int mqttport,
+                          const String& mqttuser, const String& mqttpass, const String& mqttidIn) {
+    String ssid   = ssidIn;   ssid.trim();
+    String wolmac = wolmacIn; wolmac.trim();
+    String mqttsvr = mqttsvrIn; mqttsvr.trim();
+    String mqttid  = mqttidIn;  mqttid.trim();
+
+    if (ssid.length() == 0)   return "WiFi SSID 不能为空。";
+    if (wolmac.length() != 12) return "WoL MAC 地址必须是 12 位十六进制字符（无分隔符）。";
+    for (int i = 0; i < 12; i++)
+        if (!isxdigit((unsigned char)wolmac[i])) return "WoL MAC 地址包含非十六进制字符。";
+    if (withMqtt) {
+        if (mqttsvr.length() == 0) return "MQTT 服务器地址不能为空。";
+        if (mqttid.length()  == 0) return "MQTT Client ID 不能为空。";
+    }
+
+    // 写入 cfg 并更新 WiFi 历史列表
+    lruAddOrUpdate(ssid.c_str(), wpass.c_str());
+    saveWifiNetworks();
+    strlcpy(cfg.wifi_ssid, lruGet(0)->ssid, sizeof(cfg.wifi_ssid));
+    strlcpy(cfg.wifi_pass, lruGet(0)->pass, sizeof(cfg.wifi_pass));
+    strlcpy(cfg.wol_mac,   wolmac.c_str(), sizeof(cfg.wol_mac));
+    cfg.wifi_ever_ok = false;
+
+    if (withMqtt) {
+        strlcpy(cfg.mqtt_server, mqttsvr.c_str(), sizeof(cfg.mqtt_server));
+        cfg.mqtt_port = (mqttport > 0 && mqttport <= 65535) ? (uint16_t)mqttport : 8883;
+        strlcpy(cfg.mqtt_user, mqttuser.c_str(), sizeof(cfg.mqtt_user));
+        strlcpy(cfg.mqtt_pass, mqttpass.c_str(), sizeof(cfg.mqtt_pass));
+        strlcpy(cfg.mqtt_id,   mqttid.c_str(),   sizeof(cfg.mqtt_id));
+    }
+
+    if (!saveConfig()) return "配置写入 LittleFS 失败。";
+    return "";
+}
+
 static void handleAPSave() {
-    String ssid   = apServer.arg("ssid");   ssid.trim();
-    String wpass  = apServer.arg("wpass");
-    String wolmac = apServer.arg("wolmac"); wolmac.trim();
-
-    // 基础校验
-    String err = "";
-    if (ssid.length() == 0) {
-        err = "WiFi SSID 不能为空。";
-    } else if (wolmac.length() != 12) {
-        err = "WoL MAC 地址必须是 12 位十六进制字符（无分隔符）。";
-    } else {
-        bool hexOk = true;
-        for (int i = 0; i < 12; i++) hexOk = hexOk && isxdigit((unsigned char)wolmac[i]);
-        if (!hexOk) err = "WoL MAC 地址包含非十六进制字符。";
-    }
-
-    // ap_full_config 时校验 MQTT 必填项
-    String mqttsvr, mqttid;
-    if (err.length() == 0 && cfg.ap_full_config) {
-        mqttsvr = apServer.arg("mqttsvr"); mqttsvr.trim();
-        mqttid  = apServer.arg("mqttid");  mqttid.trim();
-        if (mqttsvr.length() == 0) err = "MQTT 服务器地址不能为空。";
-        else if (mqttid.length() == 0) err = "MQTT Client ID 不能为空。";
-    }
+    String err = applyAndSaveConfig(
+        apServer.arg("ssid"),  apServer.arg("wpass"), apServer.arg("wolmac"),
+        cfg.ap_full_config,
+        apServer.arg("mqttsvr"), apServer.arg("mqttport").toInt(),
+        apServer.arg("mqttuser"), apServer.arg("mqttpass"), apServer.arg("mqttid"));
 
     if (err.length() > 0) {
         StaticJsonDocument<192> errDoc;
@@ -640,26 +672,7 @@ static void handleAPSave() {
         return;
     }
 
-    // 写入 cfg 并更新 WiFi 历史列表
-    lruAddOrUpdate(ssid.c_str(), wpass.c_str());
-    saveWifiNetworks();
-    strlcpy(cfg.wifi_ssid, lruGet(0)->ssid, sizeof(cfg.wifi_ssid));
-    strlcpy(cfg.wifi_pass, lruGet(0)->pass, sizeof(cfg.wifi_pass));
-    strlcpy(cfg.wol_mac,   wolmac.c_str(), sizeof(cfg.wol_mac));
-    cfg.wifi_ever_ok = false;
-
-    if (cfg.ap_full_config) {
-        strlcpy(cfg.mqtt_server, mqttsvr.c_str(), sizeof(cfg.mqtt_server));
-        int port = apServer.arg("mqttport").toInt();
-        cfg.mqtt_port = (port > 0 && port <= 65535) ? (uint16_t)port : 8883;
-        { String v = apServer.arg("mqttuser"); v.trim(); strlcpy(cfg.mqtt_user, v.c_str(), sizeof(cfg.mqtt_user)); }
-        strlcpy(cfg.mqtt_pass, apServer.arg("mqttpass").c_str(), sizeof(cfg.mqtt_pass));
-        strlcpy(cfg.mqtt_id,   mqttid.c_str(),  sizeof(cfg.mqtt_id));
-    }
-
-    saveConfig();
     Serial.println(F("[AP] config saved, rebooting..."));
-
     apServer.send(200, "application/json", F("{\"ok\":true}"));
     delay(1500);
     ESP.restart();
@@ -732,6 +745,248 @@ void checkSoftAPFlag() {
     enterSoftAPMode();  // 永不返回
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// BLE 配网模式（阶段 1：明文 GATT + 分片协议）
+//   GATT 服务含 4 个特征：command(写) / status(读+通知) / scan(读+通知) / config(写)
+//   分片协议：每片头 4 字节 [总长 LE:2][序号:1][标志:1]，标志 bit0=末片
+//   流程：BLE 连接 → 写 "scan" 触发扫描(分片下发) → 写 config JSON(分片上传)
+//         → 设备校验落盘 → 重启生效
+//   详见 docs/BLE_REDESIGN.md
+// ═════════════════════════════════════════════════════════════════════════════
+#define BLE_SVC_UUID    "e0c1a700-2b3a-4f5c-9d7e-1a2b3c4d5e6f"
+#define BLE_CMD_UUID    "e0c1a701-2b3a-4f5c-9d7e-1a2b3c4d5e6f"
+#define BLE_STATUS_UUID "e0c1a702-2b3a-4f5c-9d7e-1a2b3c4d5e6f"
+#define BLE_SCAN_UUID   "e0c1a703-2b3a-4f5c-9d7e-1a2b3c4d5e6f"
+#define BLE_CFG_UUID    "e0c1a704-2b3a-4f5c-9d7e-1a2b3c4d5e6f"
+
+#define BLE_FRAG_HEADER   4       // 分片头字节数
+#define BLE_FRAG_CHUNK    180     // 分片 payload 上限（留足 MTU 余量）
+#define BLE_CFG_BUF_SIZE  1024    // 配置 JSON 重组缓冲上限
+#define BLE_PROV_TIMEOUT  (5UL * 60 * 1000)  // 无连接超时（ms）
+
+// ── BLE 回调与主循环共享状态（volatile：回调在 NimBLE 任务，主循环在另一任务） ──
+static volatile bool     bleClientConnected = false;
+static volatile bool     bleScanRequested   = false;
+static volatile bool     bleConfigReady     = false;
+static volatile bool     bleRebootRequested = false;
+static uint8_t           bleCfgBuf[BLE_CFG_BUF_SIZE];
+static volatile uint16_t bleCfgLen   = 0;   // 已累积字节数
+static volatile uint16_t bleCfgTotal = 0;   // 分片头声明的总字节数
+static NimBLECharacteristic* bleStatusChar = nullptr;
+static NimBLECharacteristic* bleScanChar   = nullptr;
+
+// status 特征写入文本并通知（仅主循环调用）
+static void bleSetStatus(const char* s) {
+    if (!bleStatusChar) return;
+    bleStatusChar->setValue((const uint8_t*)s, strlen(s));
+    bleStatusChar->notify();
+    Serial.printf("[BLE] status: %s\n", s);
+}
+
+// 按分片协议将一段数据经指定特征 notify 下发
+static void bleNotifyFragmented(NimBLECharacteristic* chr, const uint8_t* data, uint16_t len) {
+    uint8_t seq = 0;
+    uint16_t off = 0;
+    do {
+        uint16_t plen = (len - off > BLE_FRAG_CHUNK) ? BLE_FRAG_CHUNK : (len - off);
+        uint8_t pkt[BLE_FRAG_HEADER + BLE_FRAG_CHUNK];
+        pkt[0] = (uint8_t)(len & 0xFF);
+        pkt[1] = (uint8_t)(len >> 8);
+        pkt[2] = seq++;
+        pkt[3] = (off + plen >= len) ? 0x01 : 0x00;   // bit0 = 末片
+        memcpy(pkt + BLE_FRAG_HEADER, data + off, plen);
+        chr->setValue(pkt, BLE_FRAG_HEADER + plen);
+        chr->notify();
+        delay(30);   // 给客户端留接收间隙
+        off += plen;
+    } while (off < len);
+}
+
+// command 特征：接收 "scan" / "reboot" 文本指令
+class BleCmdCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* chr, NimBLEConnInfo&) override {
+        NimBLEAttValue v = chr->getValue();
+        const char* d = (const char*)v.data();
+        size_t n = v.length();
+        if      (n == 4 && memcmp(d, "scan",   4) == 0) bleScanRequested   = true;
+        else if (n == 6 && memcmp(d, "reboot", 6) == 0) bleRebootRequested = true;
+    }
+};
+
+// config 特征：接收分片配置 JSON，按头部重组到 bleCfgBuf
+class BleCfgCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* chr, NimBLEConnInfo&) override {
+        NimBLEAttValue v = chr->getValue();
+        const uint8_t* d = v.data();
+        size_t n = v.length();
+        if (n < BLE_FRAG_HEADER) return;
+        uint16_t total = (uint16_t)d[0] | ((uint16_t)d[1] << 8);
+        uint8_t  seq   = d[2];
+        uint8_t  flags = d[3];
+        size_t   plen  = n - BLE_FRAG_HEADER;
+        if (seq == 0) { bleCfgLen = 0; bleCfgTotal = total; }   // 首片：复位缓冲
+        if (bleCfgLen + plen <= sizeof(bleCfgBuf)) {
+            memcpy(bleCfgBuf + bleCfgLen, d + BLE_FRAG_HEADER, plen);
+            bleCfgLen += plen;
+        }
+        if (flags & 0x01) bleConfigReady = true;   // 末片：通知主循环处理
+    }
+};
+
+// 服务端连接回调：维护连接状态，断开后恢复广播
+class BleServerCallbacks : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer*, NimBLEConnInfo&) override {
+        bleClientConnected = true;
+        Serial.println(F("[BLE] client connected"));
+    }
+    void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override {
+        bleClientConnected = false;
+        Serial.println(F("[BLE] client disconnected, re-advertising"));
+        NimBLEDevice::startAdvertising();
+    }
+};
+
+// WiFi 扫描并经 scan 特征分片下发结果 JSON
+static void bleDoScan() {
+    int n = WiFi.scanNetworks();
+    StaticJsonDocument<1024> doc;
+    JsonArray arr = doc.to<JsonArray>();
+    for (int i = 0; i < n && i < 20; i++) {
+        JsonObject o = arr.add<JsonObject>();
+        o["ssid"] = WiFi.SSID(i);
+        o["rssi"] = WiFi.RSSI(i);
+    }
+    WiFi.scanDelete();
+    String json;
+    serializeJson(doc, json);
+    Serial.printf("[BLE] scan: %d network(s), %u bytes\n", n, json.length());
+    bleNotifyFragmented(bleScanChar, (const uint8_t*)json.c_str(), json.length());
+}
+
+// 解析重组好的配置 JSON，校验落盘；成功则重启（不返回），失败经 status 回报
+static void bleProcessConfig() {
+    bleConfigReady = false;
+    StaticJsonDocument<768> doc;
+    DeserializationError e = deserializeJson(doc, bleCfgBuf, bleCfgLen);
+    bleCfgLen = 0;
+    if (e) {
+        Serial.printf("[BLE] config JSON parse error: %s\n", e.c_str());
+        bleSetStatus("error:配置 JSON 解析失败。");
+        return;
+    }
+    String mqttsvr = doc["mqttsvr"] | "";
+    bool withMqtt  = mqttsvr.length() > 0;   // 携带 MQTT 字段时整套写入
+    String err = applyAndSaveConfig(
+        doc["ssid"] | "", doc["wpass"] | "", doc["wolmac"] | "",
+        withMqtt, mqttsvr, doc["mqttport"] | 8883,
+        doc["mqttuser"] | "", doc["mqttpass"] | "", doc["mqttid"] | "");
+    if (err.length() > 0) {
+        bleSetStatus((String("error:") + err).c_str());
+        return;
+    }
+    bleSetStatus("ok:rebooting");
+    delay(1000);   // 给 notify 发送窗口
+    ESP.restart();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// enterBLEProvMode：启动 NimBLE GATT 配网服务，永不返回
+// ─────────────────────────────────────────────────────────────────────────────
+void enterBLEProvMode() {
+    char devName[20];
+    snprintf(devName, sizeof(devName), "WoL-%04X", (uint16_t)(ESP.getEfuseMac() & 0xFFFF));
+    Serial.printf("\n[BLE] provisioning mode — device name: %s\n", devName);
+
+    // WiFi 置 STA 模式供扫描用；BLE 与 WiFi 在 ESP32-C3 上共存
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
+
+    NimBLEDevice::init(devName);
+    NimBLEDevice::setMTU(247);
+
+    NimBLEServer* server = NimBLEDevice::createServer();
+    server->setCallbacks(new BleServerCallbacks());
+
+    NimBLEService* svc = server->createService(BLE_SVC_UUID);
+    NimBLECharacteristic* cmdChr =
+        svc->createCharacteristic(BLE_CMD_UUID, NIMBLE_PROPERTY::WRITE);
+    cmdChr->setCallbacks(new BleCmdCallbacks());
+
+    bleStatusChar =
+        svc->createCharacteristic(BLE_STATUS_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    bleStatusChar->setValue("idle");
+
+    bleScanChar =
+        svc->createCharacteristic(BLE_SCAN_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+
+    NimBLECharacteristic* cfgChr =
+        svc->createCharacteristic(BLE_CFG_UUID, NIMBLE_PROPERTY::WRITE);
+    cfgChr->setCallbacks(new BleCfgCallbacks());
+
+    svc->start();
+
+    NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+    adv->addServiceUUID(BLE_SVC_UUID);
+    adv->setName(devName);
+    adv->enableScanResponse(true);
+    adv->start();
+    Serial.println(F("[BLE] advertising started, waiting for client..."));
+
+    unsigned long startMs   = millis();
+    unsigned long lastBlink = 0;
+    bool ledOn        = false;
+    bool everConnected = false;
+
+    while (true) {
+        yield();
+
+        // LED 500ms 慢闪提示配网模式
+        if (millis() - lastBlink >= 500) {
+            ledOn = !ledOn;
+            digitalWrite(LED_PIN, ledOn ? LOW : HIGH);
+            lastBlink = millis();
+        }
+
+        if (bleClientConnected) everConnected = true;
+
+        // 5 分钟无任何连接 → 重启回正常运行（防按键误触卡死）
+        if (!everConnected && millis() - startMs > BLE_PROV_TIMEOUT) {
+            Serial.println(F("[BLE] no client within timeout → restart"));
+            delay(100);
+            ESP.restart();
+        }
+
+        if (bleRebootRequested) {
+            Serial.println(F("[BLE] reboot requested by client"));
+            delay(200);
+            ESP.restart();
+        }
+
+        if (bleScanRequested) {
+            bleScanRequested = false;
+            bleSetStatus("scanning");
+            bleDoScan();
+            bleSetStatus("idle");
+        }
+
+        if (bleConfigReady) {
+            Serial.printf("[BLE] config received: %u/%u bytes\n", bleCfgLen, bleCfgTotal);
+            bleProcessConfig();   // 成功则重启不返回
+        }
+
+        delay(20);
+    }
+}
+
+// checkBLEProvFlag：检测 /bleprov 标志，有则进入 BLE 配网模式
+void checkBLEProvFlag() {
+    if (!LittleFS.exists("/bleprov")) return;
+    LittleFS.remove("/bleprov");
+    Serial.println(F("[CFG] /bleprov flag → BLE provisioning mode"));
+    enterBLEProvMode();  // 永不返回
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // checkRuntimeTriggers：可在任意循环中调用，非阻塞
 //   串口输入 "config"  → 写 /reconfig，重启进入串口 CLI
@@ -763,6 +1018,11 @@ void checkRuntimeTriggers() {
                 }
                 writeFlag("/softap");
                 Serial.println(F("[CFG] serial trigger → writing /softap, rebooting into SoftAP..."));
+                delay(100);
+                ESP.restart();
+            } else if (serialLineBuf == "ble") {
+                Serial.println(F("[CFG] serial trigger → writing /bleprov, rebooting into BLE mode..."));
+                writeFlag("/bleprov");
                 delay(100);
                 ESP.restart();
             } else if (serialLineBuf == "reboot") {
@@ -1679,6 +1939,9 @@ void setup() {
 
     // ── 4. SoftAP 标志检测 → SoftAP 网页配置 ──
     checkSoftAPFlag();
+
+    // ── 4b. BLE 配网标志检测 → NimBLE GATT 配网 ──
+    checkBLEProvFlag();
 
     // ── 5. 配置校验：无有效配置 → 串口 CLI ──
     if (!configOk || !hasWifi) {
