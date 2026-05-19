@@ -123,6 +123,19 @@
 - 计时从收到首字节开始，不含 TCP 握手和 HTTP 头部解析耗时
 - 执行前检查 heap 连续可用块，不足 6144 字节时拒绝并返回 `error:heap_low`
 
+### 重启局域网路由器
+
+```json
+{"cmd":"router_reboot","ip":"192.168.1.250","user":"admin","pass":"admin"}
+```
+
+- `ip`：**必填**，路由器局域网 IP
+- `user` / `pass`：可选，HTTP Basic Auth 凭据，缺省均为 `admin`
+- 设备向 `http://<ip>/cli.cgi?cmd=reboot` 发送一次带 Basic Auth 的 HTTP GET
+- **仅触发，不验证结果**：路由器收到指令后会立即断网，设备不等待重启完成
+- 上报 `router_reboot` 事件，`status` 字段为 HTTP 状态码（`<0` 为连接错误），仅供参考
+- 缺少 `ip` 字段时返回 `error:router_ip_missing`
+
 ---
 
 ## 上行事件
@@ -296,6 +309,20 @@
 }
 ```
 
+### 路由器重启已触发
+
+```json
+{
+  "event": "router_reboot",
+  "ip": "192.168.1.250",
+  "status": 200,
+  "uptime": 3615,
+  "heap": 44000
+}
+```
+
+> `status`：HTTP 状态码。`200` 表示路由器已接收指令；`<0` 为连接错误（如路由器不可达）。仅供参考，不代表路由器是否真正重启成功。
+
 ### OTA 事件
 
 升级开始（MQTT 断开前发出）：
@@ -376,4 +403,5 @@
 | `error:ota_url_missing` | ota 指令缺少 `url` 字段 |
 | `error:heap_low` | speedtest 执行时 heap 连续可用块不足 6144 字节 |
 | `error:set_mqtt_no_change` | set_mqtt 指令所有字段均与当前配置相同 |
+| `error:router_ip_missing` | router_reboot 指令缺少 `ip` 字段 |
 | `error:mqtt_connect_failed` | set_mqtt 指令测试连接失败，原配置保留（附 `rc` 字段）|

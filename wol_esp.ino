@@ -32,6 +32,7 @@
  *   {"cmd":"ota","url":"https://..."}          OTA 升级（自动跟踪重定向，支持 GitHub release URL）
  *   {"cmd":"speedtest"}                         网络测速（HTTP 下载丢弃，默认 15s，MQTT 保持连接）
  *   {"cmd":"speedtest","url":"http://...","max_seconds":10}
+ *   {"cmd":"router_reboot","ip":"192.168.1.250"}  触发路由器重启（user/pass 缺省 admin）
  */
 
 #if defined(ESP8266)
@@ -1332,6 +1333,38 @@ void doSetMqtt(const char* newServer, uint16_t newPort,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// doRouterReboot：触发局域网路由器重启（fire-and-forget）
+//   向 http://<ip>/cli.cgi?cmd=reboot 发一次带 Basic Auth 的 GET
+//   不关心是否真正重启成功——路由器收到指令后会立即断网，无需等待结果
+//   user/pass 缺省均为 admin（见 mqttCallback）
+// ─────────────────────────────────────────────────────────────────────────────
+void doRouterReboot(const char* ip, const char* user, const char* pass) {
+    char url[96];
+    snprintf(url, sizeof(url), "http://%s/cli.cgi?cmd=reboot", ip);
+    Serial.printf("[ROUTER] reboot → %s  user=%s\n", url, user);
+
+    int code = -1;
+    {
+        WiFiClient c;
+        HTTPClient http;
+        http.setTimeout(5000);
+        http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+        if (http.begin(c, url)) {
+            http.setAuthorization(user, pass);
+            code = http.GET();
+            http.end();
+        }
+    }
+    Serial.printf("[ROUTER] HTTP %d\n", code);
+
+    StaticJsonDocument<160> resp;
+    resp["event"]  = "router_reboot";
+    resp["ip"]     = ip;
+    resp["status"] = code;   // HTTP 状态码，<0 为连接错误；仅供参考，不代表重启结果
+    pubJson(resp);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // mqttCallback：处理下行指令
 // ─────────────────────────────────────────────────────────────────────────────
 void mqttCallback(char* topic, byte* payload, unsigned int len) {
@@ -1495,6 +1528,17 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
         const char* url = doc["url"] | SPEEDTEST_DEFAULT_URL;
         int maxSec      = doc["max_seconds"] | SPEEDTEST_DEFAULT_SECS;
         doSpeedtest(url, maxSec);
+
+    // ── router_reboot ──
+    } else if (strcmp(cmd, "router_reboot") == 0) {
+        const char* ip   = doc["ip"]   | "";
+        const char* user = doc["user"] | "admin";
+        const char* pass = doc["pass"] | "admin";
+        if (strlen(ip) == 0) {
+            pubEvent("error:router_ip_missing");
+        } else {
+            doRouterReboot(ip, user, pass);
+        }
 
     // ── 未知指令 ──
     } else {
