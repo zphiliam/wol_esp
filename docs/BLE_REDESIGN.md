@@ -181,21 +181,44 @@ TLS + BLE GATT + ECDH 缓冲同时占用导致 OOM。
   `writeBLECharacteristicValue` / `notifyBLECharacteristicValueChange` /
   `onBLECharacteristicValueChange`。
 - **MTU**:`wx.setBLEMTU` 仅安卓有效,iOS 自动协商;分片协议照搬测试页。
-- **PSK 获取**:`wx.scanCode` 扫设备二维码,解析 `{id, psk}`(分发方案见下)。
+- **PSK 获取**:`wx.scanCode` 扫设备二维码,解析 URL query(格式见下)。
 
 ### 功能流程
 
 扫二维码取 PSK → 扫描 BLE 设备 → 连接 `WoL-XXXX` → X25519 握手 →
 触发 WiFi 扫描 → 填表单 → AES-GCM 加密下发 → 显示 status 结果。
 
-### PSK 分发方案(已定)
-
-**设备贴二维码**:PSK + deviceID 印在设备底部/内侧标签,小程序扫码获取。
-二维码内容形如 `{"id":"WoL-7kMM","psk":"<32 hex>"}`。
-安全性结论:配网模式按键门控 + PSK 不过空气,二维码方案对家用场景安全。
-产线流程:固件首次开机自生成 PSK → 串口读出 → 印二维码贴上。
-
 ### 可选(后续)
 
 - 小程序后台维护各设备最新 MQTT 凭据,换服务器时一键下发。
 - 工程位置:`miniprogram/` 子目录或独立仓库(待定)。
+
+## 10. 二维码格式契约
+
+设备贴二维码(底部/内侧标签),配网 App 扫码获取设备身份与 PSK。
+
+**格式:URL(非 JSON)**
+
+```
+https://i.iot-c.top/p?m=W1&v=1&id=wol-a1b2c3d4e5f6&psk=<32 位十六进制>
+```
+
+| 参数 | 含义 |
+|------|------|
+| `m`  | 产品型号(`PRODUCT_MODEL`,如 `W1`),兼类型守卫:App 扫码先校验 |
+| `v`  | 二维码格式版本,便于后续演进 |
+| `id` | 设备 mqtt_id(`wol-<12 位 MAC 十六进制>`),用于匹配 BLE 设备名 `WoL-XXXX` |
+| `psk`| 16 字节 PSK 的 32 位十六进制 |
+
+**为何用 URL 而非 JSON**:URL 是 JSON 的超集 ——
+
+- 今天:小程序内 `wx.scanCode` 拿到字符串,解析 query 即可,零基建
+- 以后:域名 `i.iot-c.top` 完成 ICP 备案 + 后台配「扫普通链接二维码打开小程序」
+  规则后,**同一批二维码**被微信冷扫即可拉起小程序,无需重印标签
+- 即使冷扫未配好,落地页也能引导用户「请用小程序扫码」
+
+**安全性**:配网模式按键门控 + PSK 不过空气,二维码方案对家用场景安全
+(详见 §6)。`psk` 在 URL query 中;落地页应做成纯静态、不记日志。
+
+**产线流程**:固件首次开机自生成 PSK → 采集工具读串口 `[ID]` 机读行
+(`[ID] model=W1 mqtt_id=... psk=...`)→ 套 URL 模板生成二维码 → 打印贴标。

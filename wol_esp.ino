@@ -189,13 +189,14 @@ static void genMqttId(char* buf, size_t len) {
 // 供串口 CLI、BLE 配网模式、正常运行三处的 id 命令共用；机读行便于采集工具解析。
 static void printDeviceId() {
     Serial.println(F("------ device identity ------"));
+    Serial.printf("  model   : %s\n", PRODUCT_MODEL);
     Serial.printf("  mqtt_id : %s\n", cfg.mqtt_id);
     Serial.print(F("  ble_psk : "));
     for (int i = 0; i < BLE_PSK_LEN; i++) Serial.printf("%02x", blePsk[i]);
     Serial.println();
     Serial.println(F("-----------------------------"));
-    // 机读单行：[ID] mqtt_id=... psk=...
-    Serial.printf("[ID] mqtt_id=%s psk=", cfg.mqtt_id);
+    // 机读单行：[ID] model=... mqtt_id=... psk=...
+    Serial.printf("[ID] model=%s mqtt_id=%s psk=", PRODUCT_MODEL, cfg.mqtt_id);
     for (int i = 0; i < BLE_PSK_LEN; i++) Serial.printf("%02x", blePsk[i]);
     Serial.println();
 }
