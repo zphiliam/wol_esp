@@ -140,7 +140,10 @@
 - `user` / `pass`：可选，HTTP Basic Auth 凭据；两者均省略则不带认证
 - `path`：可选，重启接口路径（不含前导 `/`），默认 `cli.cgi?cmd=reboot`
 - 机制：发起 `GET http://<ip>/<path>`，HTTP 200 即视为成功
-- 不做重启校验（路由器离线期较长），发完即上报 `router_reboot` / `router_reboot_fail`
+- 收到指令立即上报 `router_reboot_start`（先于阻塞的 HTTP 请求），确认指令送达
+- 连接阶段超时较短（不可达主机快速失败），避免长阻塞拖垮 MQTT 连接
+- 不做重启校验（路由器离线期较长），完成后上报 `router_reboot` / `router_reboot_fail`
+- 若 HTTP 期间 MQTT 掉线，结果会在重连后补发，并带 `"deferred": true` 标记
 - ESP 设备经 WiFi 联网，与目标路由器不在同一链路，重启它不影响本设备与 MQTT 连接
 - 凭据不持久化，由每次指令携带（适合 Home Assistant 等自动化定时触发）
 
@@ -319,6 +322,16 @@
 
 ### 路由器重启事件
 
+收到 `router_reboot` 指令、即将发起 HTTP 请求（ack）：
+```json
+{
+  "event": "router_reboot_start",
+  "ip": "192.168.1.250",
+  "uptime": 3600,
+  "heap": 44000
+}
+```
+
 重启指令发送成功（路由器返回 HTTP 200）：
 ```json
 {
@@ -342,6 +355,8 @@
 ```
 
 > `reason` 取值示例：`HTTP 401`（认证失败）、`HTTP error: ...`（连接错误）、`http.begin failed`
+>
+> 若结果在 MQTT 掉线期间产生，重连后补发，事件附带 `"deferred": true`。
 
 ### OTA 事件
 

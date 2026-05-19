@@ -40,7 +40,8 @@
 //   · cmd=reboot 触发重启并返回 HTTP 200（未列入 help，但实测可用）
 //   · 探测到固件 $sw_ver=2.0 p40 / $hw_ver=1.0.2.0 / 引导版本 $hw_bver=0.0.9.4
 #define ROUTER_REBOOT_PATH      "cli.cgi?cmd=reboot"  // 默认重启接口路径（不含前导 /）
-#define ROUTER_HTTP_TIMEOUT_MS  10000                 // 毫秒，路由器 HTTP 请求超时
+#define ROUTER_HTTP_TIMEOUT_MS  10000                 // 毫秒，路由器 HTTP 请求（读）超时
+#define ROUTER_HTTP_CONNECT_MS  4000                  // 毫秒，TCP 连接阶段超时（仅 ESP32-C3；不可达主机快速失败）
 
 // ── 版本 ──────────────────────────────────────────────────────────────────────
 #define FW_VERSION  "2.5.0-20260518"

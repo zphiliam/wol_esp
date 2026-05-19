@@ -129,6 +129,14 @@ bool     mqttEverConnected  = false;
 uint16_t mqttReconnectCount = 0;
 unsigned long wifiConnectMs = 0;   // WiFi 首次连接耗时（ms），写入 online 报文
 
+// ── router_reboot 结果待补发 ──────────────────────────────────────────────────
+// doRouterReboot 的 HTTP 请求若阻塞到 MQTT 掉线，结果事件会发进死连接而丢失；
+// 此时把结果暂存，connectMQTT() 重连后补发（带 deferred=true 标记）。
+bool routerResultPending  = false;
+bool routerResultSuccess  = false;
+int  routerResultHttpCode = 0;
+char routerResultReason[64] = "";
+
 // ── 运行时触发配置模式 ────────────────────────────────────────────────────────
 String        serialLineBuf;           // 串口输入行缓冲
 unsigned long btnPressStart = 0;       // 按键按下时刻
@@ -1252,19 +1260,45 @@ void doSpeedtest(const char* urlParam, int maxSeconds) {
     }
 }
 
+// pubRouterResult：发布 router_reboot / router_reboot_fail 结果事件
+//   deferred=true 表示该结果是 MQTT 掉线期间产生、重连后补发的
+void pubRouterResult(bool success, int httpCode, const char* reason, bool deferred) {
+    StaticJsonDocument<192> doc;
+    if (success) {
+        doc["event"]     = "router_reboot";
+        doc["http_code"] = httpCode;
+    } else {
+        doc["event"]  = "router_reboot_fail";
+        doc["reason"] = reason;
+    }
+    if (deferred) doc["deferred"] = true;
+    pubJson(doc);  // appends uptime / heap / ip
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // doRouterReboot：向当作交换机使用的旧路由器发送 HTTP 重启指令
 //   目标为 Broadcom 公版固件旧路由器（HTTP/1.0 服务，Basic realm="Router"），
 //   其 cli.cgi 接口 cmd=reboot 触发重启、返回 HTTP 200
 //   机制：HTTP GET http://<ip>/<path>，可选 HTTP Basic Auth；HTTP 200 视为成功
-//   不做重启校验（路由器离线 30~60s），发完即上报；MQTT 全程保持连接
-//   ESP 自身经 WiFi 联网，与该路由器不在同一链路，重启它不影响本设备
+//   不做重启校验（路由器离线 30~60s），发完即上报
+//   收到指令即发 router_reboot_start ack（确认指令送达，先于阻塞的 GET）
+//   连接阶段超时 ROUTER_HTTP_CONNECT_MS，不可达主机快速失败、不拖垮 MQTT
+//   GET 完成后若 MQTT 已断，结果暂存至 routerResult*，由 connectMQTT() 补发
 //   注：ESP 的 HTTPClient 直连目标，不经任何 HTTP 代理
 // ─────────────────────────────────────────────────────────────────────────────
 void doRouterReboot(const char* ip, const char* user, const char* pass, const char* path) {
     char url[192];
     snprintf(url, sizeof(url), "http://%s/%s", ip, path);
     Serial.printf("[RTR] reboot → %s  user=%s\n", url, user);
+
+    // 立即 ack：先于阻塞的 GET 发出，确保发送方知道指令已收到
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "{\"event\":\"router_reboot_start\",\"ip\":\"%s\",\"uptime\":%lu,\"heap\":%u}",
+            ip, millis() / 1000, ESP.getFreeHeap());
+        mqtt.publish(TOPIC_PUB, buf);
+    }
 
     bool   success  = false;
     String failReason;
@@ -1274,6 +1308,10 @@ void doRouterReboot(const char* ip, const char* user, const char* pass, const ch
         WiFiClient c;
         HTTPClient http;
         http.setTimeout(ROUTER_HTTP_TIMEOUT_MS);
+#ifndef ESP8266
+        // ESP8266 的 HTTPClient 无独立连接超时，由 setTimeout() 一并控制
+        http.setConnectTimeout(ROUTER_HTTP_CONNECT_MS);
+#endif
         http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
 
         if (!http.begin(c, url)) {
@@ -1295,15 +1333,16 @@ void doRouterReboot(const char* ip, const char* user, const char* pass, const ch
         }
     }
 
-    StaticJsonDocument<192> doc;
-    if (success) {
-        doc["event"]     = "router_reboot";
-        doc["http_code"] = httpCode;
+    if (mqtt.connected()) {
+        pubRouterResult(success, httpCode, failReason.c_str(), false);
     } else {
-        doc["event"]  = "router_reboot_fail";
-        doc["reason"] = failReason;
+        // MQTT 已掉线：结果会发进死连接而丢失，暂存到全局，重连后补发
+        routerResultPending  = true;
+        routerResultSuccess  = success;
+        routerResultHttpCode = httpCode;
+        strlcpy(routerResultReason, failReason.c_str(), sizeof(routerResultReason));
+        Serial.println(F("[RTR] MQTT 已断，结果延后补发"));
     }
-    pubJson(doc);  // appends uptime / heap / ip
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1761,6 +1800,14 @@ void connectMQTT() {
                 doc["event"] = "reconnect";
                 doc["count"] = mqttReconnectCount;
                 pubJson(doc, true);
+            }
+
+            // 补发 MQTT 掉线期间产生的 router_reboot 结果
+            if (routerResultPending) {
+                routerResultPending = false;
+                Serial.println(F("[RTR] 补发延后的 router_reboot 结果"));
+                pubRouterResult(routerResultSuccess, routerResultHttpCode,
+                                routerResultReason, true);
             }
 
         } else {
