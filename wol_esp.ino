@@ -167,9 +167,9 @@ bool loadConfig() {
     // 默认值：ESP32-C3 SuperMini 天线设计缺陷+LDO电流不足，15dBm 最稳定（ESP3D 实测推荐）
     cfg.wifi_tx_power  = doc["wifi_tx_power"]  | 15;
 
-    // 必填项校验（wifi_ssid 已迁移至 wifi_networks.json；mqtt_id 由芯片 ID 派生，均不要求）
-    return strlen(cfg.mqtt_server) > 0
-        && strlen(cfg.wol_mac)     == 12;
+    // 必填项校验（wifi_ssid 已迁移至 wifi_networks.json；mqtt_id 由芯片 ID 派生；
+    // wol_mac 改为可选——用户在手机端管理多台目标 PC，下发指令时随包带 mac）
+    return strlen(cfg.mqtt_server) > 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -465,9 +465,12 @@ void enterConfigMode() {
                 bool ok = true;
                 if (wifiCount == 0 && !explicitSsid) { Serial.println(F("[CFG] error: wifi_ssid required (or use 'wifi list' to check history)")); ok = false; }
                 if (staged.mqtt_server[0] == '\0') { Serial.println(F("[CFG] error: mqtt_server required")); ok = false; }
-                { bool hexOk = (strlen(staged.wol_mac) == 12);
-                  for (int i = 0; hexOk && i < 12; i++) hexOk = isxdigit((unsigned char)staged.wol_mac[i]);
-                  if (!hexOk) { Serial.println(F("[CFG] error: wol_mac must be 12 hex chars")); ok = false; } }
+                // wol_mac 可选：留空 = 仅响应指令里随包带 mac 的 wol；非空必须 12 hex
+                if (staged.wol_mac[0] != '\0') {
+                    bool hexOk = (strlen(staged.wol_mac) == 12);
+                    for (int i = 0; hexOk && i < 12; i++) hexOk = isxdigit((unsigned char)staged.wol_mac[i]);
+                    if (!hexOk) { Serial.println(F("[CFG] error: wol_mac must be empty or 12 hex chars")); ok = false; }
+                }
                 if (ok) {
                     // 仅当用户显式执行了 set wifi_ssid 时才写入历史列表
                     if (explicitSsid) {
@@ -537,10 +540,15 @@ void enterConfigMode() {
                         if (p > 0 && p <= 65535) staged.mqtt_port = (uint16_t)p;
                         else { Serial.println(F("[CFG] error: port must be 1-65535")); valid = false; }
                     } else if (key == "wol_mac") {
-                        bool hexOk = (val.length() == 12);
-                        for (int i = 0; hexOk && i < 12; i++) hexOk = isxdigit((unsigned char)val[i]);
-                        if (!hexOk) { Serial.println(F("[CFG] error: wol_mac must be 12 hex chars")); valid = false; }
-                        else strlcpy(staged.wol_mac, val.c_str(), sizeof(staged.wol_mac));
+                        // 传 '-' 清除已存 MAC；其余必须是 12 位 hex
+                        if (val == "-") {
+                            staged.wol_mac[0] = '\0';
+                        } else {
+                            bool hexOk = (val.length() == 12);
+                            for (int i = 0; hexOk && i < 12; i++) hexOk = isxdigit((unsigned char)val[i]);
+                            if (!hexOk) { Serial.println(F("[CFG] error: wol_mac must be 12 hex chars (or '-' to clear)")); valid = false; }
+                            else strlcpy(staged.wol_mac, val.c_str(), sizeof(staged.wol_mac));
+                        }
                     } else if (key == "wifi_tx_power") {
                         int p = val.toInt();
                         if (p != 0 && (p < 2 || p > 20)) {
@@ -591,9 +599,12 @@ String applyAndSaveConfig(const String& ssidIn, const String& wpass, const Strin
     String mqttsvr = mqttsvrIn; mqttsvr.trim();
 
     if (ssid.length() == 0)   return "WiFi SSID 不能为空。";
-    if (wolmac.length() != 12) return "WoL MAC 地址必须是 12 位十六进制字符（无分隔符）。";
-    for (int i = 0; i < 12; i++)
-        if (!isxdigit((unsigned char)wolmac[i])) return "WoL MAC 地址包含非十六进制字符。";
+    // wol_mac 可选：留空表示设备不存默认 MAC，仅响应指令里随包带的 mac
+    if (wolmac.length() > 0) {
+        if (wolmac.length() != 12) return "WoL MAC 地址留空或必须是 12 位十六进制字符（无分隔符）。";
+        for (int i = 0; i < 12; i++)
+            if (!isxdigit((unsigned char)wolmac[i])) return "WoL MAC 地址包含非十六进制字符。";
+    }
     if (withMqtt && mqttsvr.length() == 0) return "MQTT 服务器地址不能为空。";
 
     // 写入 cfg 并更新 WiFi 历史列表
@@ -635,7 +646,7 @@ String applyAndSaveConfig(const String& ssidIn, const String& wpass, const Strin
 #define BLE_FRAG_HEADER   4       // 分片头字节数
 #define BLE_FRAG_CHUNK    180     // 分片 payload 上限（留足 MTU 余量）
 #define BLE_CFG_BUF_SIZE  1024    // 配置载荷重组缓冲上限
-#define BLE_PROV_TIMEOUT  (5UL * 60 * 1000)  // 配网模式超时（ms，仅对已配置设备生效）
+#define BLE_PROV_TIMEOUT  (20UL * 60 * 1000) // 配网模式无 BLE 连接活动超时（ms，仅对已配置设备生效）
 #define BLE_GCM_IV_LEN    12      // AES-GCM 随机 IV 长度
 #define BLE_GCM_TAG_LEN   16      // AES-GCM 认证标签长度
 
@@ -811,28 +822,63 @@ static void bleDoScan() {
 }
 
 // 处理握手：用收到的客户端公钥做 X25519 ECDH，派生会话密钥，回传设备公钥
+//
+// 注意：ESP-IDF 的 mbedtls Curve25519 (Everest variant) 实现使用 TLS 线缆格式
+// (`[长度前缀 0x20][32 字节公钥]`)，因此本地缓冲必须 ≥ 33 字节；BLE 线缆上
+// 客户端发送/接收的仍是 raw 32 字节，需要在固件这一侧手动加/去长度前缀。
 static void bleDoHandshake() {
-    uint8_t devPub[32], shared[32];
+    uint8_t devPubWire[33];     // [0]=0x20, [1..32]=公钥;给 mbedtls 用
+    uint8_t cliPubWire[33];     // [0]=0x20, [1..32]=客户端公钥;给 mbedtls 用
+    uint8_t shared[32];
     size_t  olen = 0;
-    bool    ok   = false;
+    int     rc   = 0;
+    int     stage = 0;
     mbedtls_ecdh_context ecdh;
     mbedtls_ecdh_init(&ecdh);
+
+    // 打印收到的客户端公钥(诊断用)
+    Serial.print(F("[BLE] client pubkey: "));
+    for (int i = 0; i < 32; i++) Serial.printf("%02x", bleClientPub[i]);
+    Serial.println();
+
+    // 构造 TLS 格式的客户端公钥:1 字节长度 + 32 字节 key
+    cliPubWire[0] = 32;
+    memcpy(cliPubWire + 1, bleClientPub, 32);
+
     do {
-        if (mbedtls_ecdh_setup(&ecdh, MBEDTLS_ECP_DP_CURVE25519) != 0) break;
-        if (mbedtls_ecdh_make_public(&ecdh, &olen, devPub, sizeof(devPub),
-                                     bleRng, nullptr) != 0 || olen != 32) break;
-        if (mbedtls_ecdh_read_public(&ecdh, bleClientPub, 32) != 0) break;
-        if (mbedtls_ecdh_calc_secret(&ecdh, &olen, shared, sizeof(shared),
-                                     bleRng, nullptr) != 0 || olen != 32) break;
-        ok = true;
+        stage = 1;
+        rc = mbedtls_ecdh_setup(&ecdh, MBEDTLS_ECP_DP_CURVE25519);
+        if (rc != 0) break;
+
+        stage = 2;
+        rc = mbedtls_ecdh_make_public(&ecdh, &olen, devPubWire, sizeof(devPubWire),
+                                      bleRng, nullptr);
+        if (rc != 0) break;
+        if (olen != 33) { rc = -0xAAAA; break; }   // 期望 1 字节前缀 + 32 字节
+
+        stage = 3;
+        rc = mbedtls_ecdh_read_public(&ecdh, cliPubWire, sizeof(cliPubWire));
+        if (rc != 0) break;
+
+        stage = 4;
+        rc = mbedtls_ecdh_calc_secret(&ecdh, &olen, shared, sizeof(shared),
+                                      bleRng, nullptr);
+        if (rc != 0) break;
+        if (olen != 32) { rc = -0xBBBB; break; }
+
+        stage = 0;   // 全部成功
     } while (0);
     mbedtls_ecdh_free(&ecdh);
 
-    if (!ok) {
-        Serial.println(F("[BLE] handshake (X25519) failed"));
+    if (stage != 0) {
+        Serial.printf("[BLE] handshake (X25519) failed at stage %d, rc=-0x%04x\n",
+                      stage, (unsigned)(-rc) & 0xFFFF);
         bleSetStatus("error:密钥交换失败。");
         return;
     }
+
+    // 把 raw 32 字节设备公钥指针保存到 devPub(去掉 TLS 长度前缀),后续 notify 用
+    const uint8_t* devPub = devPubWire + 1;
     bleDeriveSessionKey(shared, 32);
     bleSessionReady = true;
     bleHsChar->setValue(devPub, 32);
@@ -943,7 +989,7 @@ void enterBLEProvMode() {
 
     // 设备是否已有有效配置：决定超时行为（无配置时重启只会再进本模式，故常驻）
     bool hasConfig = LittleFS.exists("/config.json");
-    unsigned long startMs   = millis();
+    unsigned long lastActivityMs = millis();  // 客户端连接期间持续刷新，断开后开始倒计时
     unsigned long lastBlink = 0;
     bool ledOn = false;
 
@@ -982,10 +1028,12 @@ void enterBLEProvMode() {
             lastBlink = millis();
         }
 
-        // 配网超时 → 重启回正常运行（防按键误触/连上又中途放弃使设备长期滞留）。
-        // 仅对已有配置的设备生效；无配置设备常驻配网（重启也只会再进本模式）。
-        if (hasConfig && millis() - startMs > BLE_PROV_TIMEOUT) {
-            Serial.println(F("[BLE] provisioning timeout → restart"));
+        // 无 BLE 连接活动超时 → 重启回正常运行（防按键误触/连上又中途放弃使设备长期滞留）。
+        // 连接期间持续刷新计时器，仅在客户端断开/未接入时累计；仅对已有配置的设备生效，
+        // 无配置设备常驻配网（重启也只会再进本模式）。
+        if (bleClientConnected) lastActivityMs = millis();
+        if (hasConfig && millis() - lastActivityMs > BLE_PROV_TIMEOUT) {
+            Serial.println(F("[BLE] provisioning idle timeout → restart"));
             delay(100);
             ESP.restart();
         }
@@ -1607,6 +1655,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
             if (!hexOk) { pubEvent("error:invalid_mac"); return; }
             target_mac = mac_param;
         }
+        // 设备未存默认 MAC 且指令未带 mac → 拒绝（用户应在手机端指定目标）
+        if (strlen(target_mac) != 12) { pubEvent("error:no_mac"); return; }
         sendMagicPacket(target_mac);
         StaticJsonDocument<96> resp;
         resp["event"] = "wol";

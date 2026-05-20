@@ -16,16 +16,19 @@
 所有指令均为 JSON 格式，发送到 `cmd` 主题。
 
 ### 唤醒电脑
-```json
-{"cmd":"wol"}
-```
 
-指定目标 MAC（不填则使用设备配置中的 `wol_mac`）：
+**推荐**：每次随包指定目标 MAC（用户在手机端管理多台电脑）：
 ```json
 {"cmd":"wol","mac":"AABBCCDDEEFF"}
 ```
 
-> `mac` 格式：12 位十六进制字符，无分隔符，大小写均可
+省略 `mac` 字段时，使用设备配置中的 `wol_mac` 作为兜底：
+```json
+{"cmd":"wol"}
+```
+
+> - `mac` 格式：12 位十六进制字符，无分隔符，大小写均可
+> - 若指令未带 `mac` 且设备未存默认 MAC（`wol_mac` 为空），返回 `error:no_mac` 事件，不发包
 
 ### 测试连通性
 ```json
@@ -42,7 +45,7 @@
 {"cmd":"info"}
 ```
 
-响应包含：version、当前连接 ssid/rssi、wol_mac、MQTT 重连次数，以及公共字段 uptime/heap/ip。
+响应包含：version、当前连接 ssid/rssi、wol_mac（未配置时为空字符串）、MQTT 重连次数，以及公共字段 uptime/heap/ip。
 
 ### 查询完整配置
 ```json
@@ -259,6 +262,7 @@
 
 > - `mqtt_pass` 出于安全考虑不予返回
 > - `wifi_networks`：历史 WiFi 列表（仅 SSID，不含密码），按最近连接顺序排列
+> - `wol_mac`：未配置时为空字符串
 
 ### 测速事件
 
@@ -373,6 +377,7 @@
 | `error:status_interval_too_long` | status_interval 大于 3600s |
 | `error:unknown_led_val` | 未知 LED val 值 |
 | `error:invalid_mac` | wol 指令中 `mac` 参数格式非法 |
+| `error:no_mac` | wol 指令未带 `mac` 且设备未存默认 `wol_mac` |
 | `error:ota_url_missing` | ota 指令缺少 `url` 字段 |
 | `error:heap_low` | speedtest 执行时 heap 连续可用块不足 6144 字节 |
 | `error:set_mqtt_no_change` | set_mqtt 指令所有字段均与当前配置相同 |

@@ -2,3 +2,6 @@ venv
 config.txt
 __pycache__
 *.pyc
+
+# 产线身份采集输出（含每台设备 PSK，不入仓）
+devices.csv

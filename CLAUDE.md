@@ -57,6 +57,9 @@
 - BLE PSK 存于独立文件 `/ble_psk.bin`(见 BLE 配网章节)。
 - `wifi_ssid` / `wifi_pass`：记录最近一次成功连接的网络，兼作降级兜底（若
   `/wifi_networks.json` 损坏可迁移回来）
+- `wol_mac` **可选**：终端形态下用户在手机端管理多台目标 PC，下发 `wol` 指令时
+  随包携带 `mac` 字段。设备内 `wol_mac` 留空时，未带 `mac` 的 `wol` 指令回
+  `error:no_mac` 事件，不发包。配置入口非空时仍校验为 12 位十六进制。
 
 **`/wifi_networks.json`** — WiFi 历史网络列表（最多 5 条，头部 = 最近连接）：
 ```json
