@@ -84,16 +84,18 @@
 ### 在线更新 MQTT 连接配置
 
 ```json
-{"cmd":"set_mqtt","server":"new.broker.example.com","port":8883,"user":"newuser","pass":"newpass","id":"new_id"}
+{"cmd":"set_mqtt","server":"new.broker.example.com","port":8883,"user":"newuser","pass":"newpass"}
 ```
 
-- 所有字段均为可选，省略的字段保留当前值；但**至少需提供一个与当前配置不同的字段**
+- 可改字段：`server` / `port` / `user` / `pass`，均为可选，省略的字段保留当前值；
+  但**至少需提供一个与当前配置不同的字段**，否则返回 `error:set_mqtt_no_change`
+- `mqtt_id` 由芯片 eFuse MAC 派生、不可更改，故 topic 不随之变化（无 `id` 字段）
 - 执行流程：
-  1. 断开当前 MQTT 连接
-  2. 用独立临时客户端测试新配置的连接与认证
-  3. 测试成功 → 写入 `/config.json`，切换到新 broker，发布 `ok:mqtt_updated`
-  4. 测试失败 → 保留原配置，重连原 broker，发布 `error:mqtt_connect_failed`
-- `mqtt_id` 变更时订阅/发布主题随之更新（变更后的响应在新主题上发布）
+  1. 先清除当前 broker 上的 retained 事件（发空 payload），再断开当前 MQTT 连接
+  2. 用独立临时客户端测试新配置的连接与认证（单次 TCP 超时 10s）
+  3. **测试成功** → 写入 `/config.json` → **设备重启** → 以新配置连接新 broker，
+     新 broker 上的 `online` 事件即为切换成功的隐式确认（不单独发成功事件）
+  4. **测试失败** → 保留原配置 → 重连原 broker 发布 `error:mqtt_connect_failed`（附 `rc`）→ **重启**
 
 ### OTA 固件升级
 
@@ -351,12 +353,9 @@
 
 ### set_mqtt 操作响应
 
-成功（已切换到新 broker，此后响应在新主题发布）：
-```json
-{"event":"ok:mqtt_updated","uptime":123,"heap":44000}
-```
+成功时设备**直接重启**，不在原 broker 发送成功事件；切换成功以**新 broker 上收到的 `online` 事件**为准（见「设备上线」）。
 
-失败（保留原配置，在原 broker 发布）：
+失败（保留原配置，在原 broker 发布后重启）：
 ```json
 {"event":"error:mqtt_connect_failed","rc":-4,"uptime":123,"heap":44000}
 ```

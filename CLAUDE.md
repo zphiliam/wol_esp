@@ -14,6 +14,7 @@
 | `config.h` | 编译期常量（超时参数、行为参数、配置触发引脚、版本号）；**不含凭据** |
 | `PROTOCOL.md` | MQTT 主题与报文格式文档 |
 | `docs/BLE_REDESIGN.md` | BLE 配网设计方案与 GATT 协议 |
+| `docs/ARCHITECTURE_v3.md` | 服务端架构：自建 EMQX + 后端中转 + 微信小程序（含权限/claim/时序） |
 | `test/ble_test.html` | Web Bluetooth 配网测试页（开发用） |
 
 ## 硬件（ESP32-C3 SuperMini）

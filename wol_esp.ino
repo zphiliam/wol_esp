@@ -30,6 +30,7 @@
  *   {"cmd":"led","val":"on|off|toggle|query"}  控制 LED
  *   {"cmd":"led","val":"blink","times":5,"interval":500}
  *   {"cmd":"set","key":"status_interval","val":30}  设置状态上报间隔（秒，0=禁用）
+ *   {"cmd":"set_mqtt","server":"...","port":8883,"user":"...","pass":"..."}  在线换 broker（成功后重启）
  *   {"cmd":"ota","url":"https://..."}          OTA 升级（自动跟踪重定向，支持 GitHub release URL）
  *   {"cmd":"speedtest"}                         网络测速（HTTP 下载丢弃，默认 15s，MQTT 保持连接）
  *   {"cmd":"speedtest","url":"http://...","max_seconds":10}
