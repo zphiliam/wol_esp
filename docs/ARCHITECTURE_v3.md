@@ -156,6 +156,18 @@ EMQX 把认证委托给后端。请求体模板:
   `config` 通道进真设备;后端只存其**哈希**(HMAC-SHA256 + pepper),**配网时轮换**。
 - 配网这一步**同时**完成「重绑 + 签发/轮换 mqtt_pass」,两层在同一动作里一并搞定。
 
+### 5.3 claim 接口的滥用防护(防枚举 + 限流)
+
+`mqtt_id` 由芯片 MAC 派生、**同批次常连号**,看到一台就能猜邻居。PSK 虽在二维码上
+(物理在场才拿得到),但若 claim 据响应差异区分「设备不存在 / 已停用 / PSK 不符」,
+攻击者无需 PSK 也能遍历 mqtt_id 段、**探出哪些 ID 是真实出厂设备**(泄露铺货量/真实
+ID)。故后端实现上:
+
+- **泛化错误**:三类失败一律返回同一个 `403 claim_failed`(状态码与文案都不露差异),
+  真实原因只记服务端日志。
+- **令牌桶限流**:按 openid 计桶(容量 8 / 每 5 秒回填 1),挡高速枚举与 PSK 暴力。
+  注:未配微信时 openid 来自 dev 桩可伪造,生产配 `code2session` 后该面收敛。
+
 ## 6. 时序
 
 ### 6.1 配网 + claim 绑定(配网即重绑)
@@ -231,12 +243,16 @@ EMQX 把认证委托给后端。请求体模板:
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/auth/wechat-login` | 微信登录,换 openid + 会话 token |
-| POST | `/devices/claim` | 扫码绑定(**覆盖式重绑**):body `{mqtt_id, psk, ...}`;验真后绑给当前用户、轮换 mqtt_pass、返回 BLE 下发所需的 mqtt 配置 |
+| POST | `/devices/claim` | 扫码绑定(**覆盖式重绑**):body `{mqtt_id, psk, ...}`;验真后绑给当前用户、轮换 mqtt_pass、返回 BLE 下发所需的 mqtt 配置。失败泛化 + 限流见 5.3 |
 | GET | `/devices` | 当前用户名下设备列表 + 在线状态 |
 | POST | `/devices/{id}/wol` | 唤醒:body `{mac?}`;同步等待或返回 task id |
 | POST | `/devices/{id}/cmd` | 透传其它指令(reboot/info/led/ota…),后端校验归属 |
 | GET | `/devices/{id}/events` | SSE:前台打开时推该设备事件 |
 | POST | `/devices/{id}/unbind` | 解绑 |
+
+> **鉴权**:除 `/auth/wechat-login` 外,登录后所有接口均走两层——认证用 `Authorization:
+> Bearer <token>`(登录签发的自包含 HMAC 会话 token,载 openid),授权再按 openid 校
+> 设备归属(`ownerCheck`),非主人回 `403 not_owner`。
 
 ### 对 EMQX
 
@@ -248,6 +264,13 @@ EMQX 把认证委托给后端。请求体模板:
 
 > 事件消费二选一:常驻 MQTT 订阅实现简单、实时;规则引擎 webhook 无需常驻连接、
 > 更易水平扩展。小规模用常驻订阅即可。
+
+### 对运维(管理后台 `/admin`)
+
+内嵌的可视化设备管理后台(React 构建产物经 `//go:embed` 打进二进制),与小程序用户态
+**完全分离**:设 `ADMIN_PASSWORD` 即启用,口令登录后走 HttpOnly cookie 会话。能力含
+仪表盘、设备列表(状态过滤 + 搜索)、详情(归属/唤醒目标/启用停用/强制解绑/下发指令/
+SSE 实时事件)、CSV 批量导入与单台补录、用户列表。详见 esp_auth 仓 `README.md`。
 
 ## 8. 存储(后端)
 

@@ -6,6 +6,13 @@
 向局域网内目标电脑发送 WoL 魔法包。v3.0 起为面向终端用户的版本：配网统一走低功耗
 蓝牙（BLE），不再兼容 ESP8266（无蓝牙射频）。
 
+## 关联仓库
+
+| 仓库 | 路径 | 说明 |
+|------|------|------|
+| `esp_auth` | `../esp_auth` | v3 后端服务（Go + SQLite）：微信小程序 API、EMQX HTTP 认证钩子（`POST /mqtt/auth`）、配网即重绑（claim）、指令中转与设备状态。落地 `docs/ARCHITECTURE_v3.md` 设计 |
+| `wolapp` | `../wolapp` | 微信小程序（uniapp Vue3，mp-weixin）：扫码 BLE 加密配网、管理控制器与目标电脑（1:N）、一键唤醒（下发携带电脑 MAC）。BLE 加密栈对接 `docs/BLE_REDESIGN.md`（X25519/AES-GCM/HMAC-SHA256） |
+
 ## 文件结构
 
 | 文件 | 说明 |
