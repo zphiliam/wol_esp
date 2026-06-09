@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 产线身份采集工具：串口连接 ESP32-C3，发送 `id` 命令，解析机读单行
-`[ID] model=... mqtt_id=... psk=...`，追加到 CSV，便于后续生成二维码贴标。
+`[ID] model=... mqtt_id=... mac=... psk=...`，追加到 CSV，便于后续生成二维码贴标。
+
+`mac` 为芯片出厂 WiFi STA MAC（路由器可见的标准 MAC，12 位十六进制）；旧固件
+不输出该字段时为空，脚本仍兼容。
 
 用法：
     # 自动识别 Espressif 设备（默认）
@@ -28,11 +31,13 @@ import serial.tools.list_ports as list_ports
 BAUD = 115200
 BOOT_DRAIN_SECONDS = 2.0      # 打开串口后等待 USB-CDC reset 完成的时间
 ESP_VID = 0x303A              # Espressif 默认 USB VID（ESP32-C3 native USB-CDC）
+# mac 字段对旧固件可缺省（整段可选），保持向后兼容
 ID_LINE_RE = re.compile(
-    r"^\[ID\]\s+model=(\S+)\s+mqtt_id=(\S+)\s+psk=([0-9a-fA-F]+)\s*$"
+    r"^\[ID\]\s+model=(\S+)\s+mqtt_id=(\S+)(?:\s+mac=([0-9a-fA-F]+))?\s+psk=([0-9a-fA-F]+)\s*$"
 )
+# 二维码仅承载配网所需字段（model/id/psk）；mac 仅入 CSV 台账，不进二维码
 QR_URL_TEMPLATE = "https://i.iot-c.top/p?m={model}&v=1&id={mqtt_id}&psk={psk}"
-CSV_COLUMNS = ["timestamp", "model", "mqtt_id", "psk", "qr_url", "port"]
+CSV_COLUMNS = ["timestamp", "model", "mqtt_id", "mac", "psk", "qr_url", "port"]
 
 
 def find_esp_devices(vid: int = ESP_VID) -> list:
@@ -81,8 +86,10 @@ def append_row(csv_path: Path, row: dict) -> None:
         writer.writerow(row)
 
 
-def capture_one(port: str, timeout: float) -> tuple[str, str, str]:
-    """打开串口、发 id、等 [ID] 行；返回 (model, mqtt_id, psk)。"""
+def capture_one(port: str, timeout: float) -> tuple[str, str, str, str]:
+    """打开串口、发 id、等 [ID] 行；返回 (model, mqtt_id, mac, psk)。
+
+    mac 在旧固件不输出时为空字符串。"""
     with serial.Serial(port, BAUD, timeout=0.2) as s:
         # 等待 USB-CDC reset / setup banner 完成，顺手清空缓冲
         time.sleep(BOOT_DRAIN_SECONDS)
@@ -105,8 +112,10 @@ def capture_one(port: str, timeout: float) -> tuple[str, str, str]:
                     text = line.decode("utf-8", errors="replace").rstrip("\r")
                     m = ID_LINE_RE.match(text)
                     if m:
-                        model, mqtt_id, psk = m.group(1), m.group(2), m.group(3).lower()
-                        return model, mqtt_id, psk
+                        model, mqtt_id = m.group(1), m.group(2)
+                        mac = (m.group(3) or "").upper()
+                        psk = m.group(4).lower()
+                        return model, mqtt_id, mac, psk
             # 每 2s 再发一次，应对设备刚 boot / 在 BLE 模式忙
             if time.monotonic() - last_resend > 2.0:
                 s.write(b"id\n")
@@ -119,7 +128,7 @@ def capture_one(port: str, timeout: float) -> tuple[str, str, str]:
 def collect(port: str, csv_path: Path, timeout: float, emit_url: bool) -> bool:
     """采集一次并写 CSV；返回 True 表示成功。"""
     try:
-        model, mqtt_id, psk = capture_one(port, timeout)
+        model, mqtt_id, mac, psk = capture_one(port, timeout)
     except serial.SerialException as e:
         print(f"  [错误] 串口异常：{e}", file=sys.stderr)
         return False
@@ -136,6 +145,7 @@ def collect(port: str, csv_path: Path, timeout: float, emit_url: bool) -> bool:
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "model": model,
         "mqtt_id": mqtt_id,
+        "mac": mac,
         "psk": psk,
         "qr_url": qr_url,
         "port": port,
@@ -143,7 +153,7 @@ def collect(port: str, csv_path: Path, timeout: float, emit_url: bool) -> bool:
     append_row(csv_path, row)
 
     tag = "[重复]" if is_dup else "[新增]"
-    print(f"  {tag} model={model} mqtt_id={mqtt_id} psk={psk}")
+    print(f"  {tag} model={model} mqtt_id={mqtt_id} mac={mac or '-'} psk={psk}")
     if qr_url:
         print(f"        {qr_url}")
     if is_dup:

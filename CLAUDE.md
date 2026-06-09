@@ -137,9 +137,11 @@ setup()
 
 - `save`：若 staged 中有 `wifi_ssid`，追加到历史列表头部；写入 LittleFS 并自动重启
 - `wifi list` / `wifi del <n>`：列出 / 删除历史 WiFi 网络
-- `id`：打印设备 `mqtt_id`（芯片派生）与 BLE PSK（hex），用于贴二维码 / 服务端配置。
-  同一命令在**正常运行**与 **BLE 配网模式**的串口也可用（无需重启 / 切模式）；
-  除人读框外另输出机读单行 `[ID] mqtt_id=... psk=...`，便于采集工具解析
+- `id`：打印设备 `mqtt_id`（芯片派生）、芯片 MAC（WiFi STA，路由器可见的标准 MAC）
+  与 BLE PSK（hex），用于贴二维码 / 服务端配置。同一命令在**正常运行**与
+  **BLE 配网模式**的串口也可用（无需重启 / 切模式）；除人读框外另输出机读单行
+  `[ID] model=... mqtt_id=... mac=... psk=...`，便于采集工具解析（`scripts/collect_id.py`）。
+  注意 `mac` 与 `mqtt_id` 同源自 eFuse，但 mqtt_id 的 hex 为字节反序，故单独输出真实 MAC
 - `ble`：切换到 BLE 配网模式
 - `reset`：清除 `config.json` 和 `wifi_networks.json` 并重启
 

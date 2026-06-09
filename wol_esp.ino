@@ -58,6 +58,7 @@
 #include <mbedtls/md.h>
 
 #include "esp_wifi.h"   // esp_wifi_set_max_tx_power()
+#include "esp_mac.h"    // esp_read_mac()
 
 // ── 硬件 ──────────────────────────────────────────────────────────────────────
 const uint8_t LED_PIN = 8;   // ESP32-C3 SuperMini，active LOW
@@ -189,15 +190,25 @@ static void genMqttId(char* buf, size_t len) {
 // 打印设备身份（mqtt_id + BLE PSK）：人读框 + 机读单行 [ID]。
 // 供串口 CLI、BLE 配网模式、正常运行三处的 id 命令共用；机读行便于采集工具解析。
 static void printDeviceId() {
+    // 芯片出厂 WiFi STA MAC（路由器/DHCP 可见的标准 MAC）。
+    // 与 mqtt_id 同源自 eFuse，但 mqtt_id 的 hex 是字节反序，故单独输出真实 MAC。
+    // esp_read_mac 不依赖 WiFi 初始化，三种模式下均可调用。
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+
     Serial.println(F("------ device identity ------"));
     Serial.printf("  model   : %s\n", PRODUCT_MODEL);
     Serial.printf("  mqtt_id : %s\n", cfg.mqtt_id);
+    Serial.printf("  mac     : %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     Serial.print(F("  ble_psk : "));
     for (int i = 0; i < BLE_PSK_LEN; i++) Serial.printf("%02x", blePsk[i]);
     Serial.println();
     Serial.println(F("-----------------------------"));
-    // 机读单行：[ID] model=... mqtt_id=... psk=...
-    Serial.printf("[ID] model=%s mqtt_id=%s psk=", PRODUCT_MODEL, cfg.mqtt_id);
+    // 机读单行：[ID] model=... mqtt_id=... mac=... psk=...
+    Serial.printf("[ID] model=%s mqtt_id=%s mac=%02X%02X%02X%02X%02X%02X psk=",
+                  PRODUCT_MODEL, cfg.mqtt_id,
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     for (int i = 0; i < BLE_PSK_LEN; i++) Serial.printf("%02x", blePsk[i]);
     Serial.println();
 }
