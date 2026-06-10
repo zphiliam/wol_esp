@@ -65,7 +65,7 @@ home/wol/{device_id}/event   → 事件(上行)
 | 主体 | clientid | publish | subscribe |
 |------|----------|---------|-----------|
 | **设备** | `wol-<mac>` | `home/wol/<自身>/event` | `home/wol/<自身>/cmd` |
-| **后端中转** | `backend-<n>` | `home/wol/+/cmd` | `home/wol/+/event` |
+| **后端中转** | `esp_auth_01`(username `esp_admin`) | `home/wol/+/cmd` | `home/wol/+/event` |
 | 其它 | — | deny | deny |
 
 小程序不在此表中(不连 MQTT)。设备被锁死在自身 topic;后端是唯一的"应用侧"
@@ -87,9 +87,10 @@ authorization.deny_action = disconnect
 {allow, all, subscribe, ["home/wol/${clientid}/cmd"]}.
 {allow, all, publish,   ["home/wol/${clientid}/event"]}.
 
-%% 2) 后端中转账号(用 username 匹配,或直接设为 superuser)
-{allow, {username, "backend"}, subscribe, ["home/wol/+/event"]}.
-{allow, {username, "backend"}, publish,   ["home/wol/+/cmd"]}.
+%% 2) 后端中转账号(生产实际走 superuser——认证响应携带 is_superuser,
+%%    EMQX 对超级用户跳过 ACL;下面两条 username 规则仅作双保险)
+{allow, {username, "esp_admin"}, subscribe, ["home/wol/+/event"]}.
+{allow, {username, "esp_admin"}, publish,   ["home/wol/+/cmd"]}.
 ```
 
 > 设备授权用 `${clientid}` 占位符,EMQX 本地即可判定,后端不参与设备授权,
@@ -112,7 +113,16 @@ EMQX 把认证委托给后端。请求体模板:
 { "result": "allow" }
 ```
 
-**后端中转账号**:固定强密码,返回 `allow`(授权走第 3 节的 username 规则)。
+**后端中转账号**(username `esp_admin`,固定强密码):
+
+```json
+{ "result": "allow", "is_superuser": true }
+```
+
+`is_superuser` 使 EMQX 对该连接跳过 ACL;第 3 节的 username 规则仅作双保险。
+账号不绑定 clientid,可多端并发(如 MQTTX 调试),各连接独立认证、各自拿到
+superuser 标记;注意调试端 clientid 勿与常驻消费者 `esp_auth_01` 相同(会互踢),
+也勿以 `wol-` 开头(会被当设备拒掉)。
 
 > 授权全部走第 3 节的 EMQX 本地规则,认证响应不需要再返回 `acl` 字段
 > (因为没有"每用户动态 ACL"了——小程序不连 MQTT)。
