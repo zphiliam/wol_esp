@@ -9,7 +9,8 @@
 早期设想"无服务端、设备直连 EMQX Serverless"。v3 改为**自建云服务器跑 EMQX**,
 配套一个后端服务,配网与控制通过**微信小程序**完成。
 
-核心决策:**小程序不直连 MQTT**,改为"后端常驻 MQTT 消费者 + 小程序走 HTTPS/SSE"。
+核心决策:**小程序不直连 MQTT**,改为"后端常驻 MQTT 消费者 + 小程序走 HTTPS
+(指令触发 + 短轮询取结果)"。
 理由(详见决策记录一节):
 
 - 小程序无法常驻后台,直连只在前台有效,离线通知无论如何要走后端;
@@ -25,7 +26,7 @@
   微信小程序                 │  ┌──────────┐      ┌──────────────┐  │
   ┌─────────┐   HTTPS       │  │  后端服务  │      │    EMQX       │  │
   │  小程序  │ ───────────▶ │  │ (API +    │◀────▶│  (broker)    │  │
-  │         │ ◀─SSE/轮询──  │  │  MQTT     │ REST │              │  │
+  │         │ ◀─短轮询────  │  │  MQTT     │ REST │              │  │
   │         │               │  │  消费者)   │ pub  │              │  │
   └────┬────┘   微信订阅消息  │  └────┬─────┘      └──────┬───────┘  │
        │      ◀───────────── │       │ HTTP auth         │          │
@@ -205,7 +206,7 @@ ID)。故后端实现上:
  │           │                │                 │  online    │
  │           │                │◀── event(online,retain)──────│
  │           │  设备在线        │ 更新状态缓存      │           │
- │           │◀─SSE/轮询───────│                 │           │
+ │           │◀─轮询 /devices──│                 │           │
 ```
 
 `claim` 是**覆盖式重绑**:不校验旧主人、不需重置计数器(见 5.1 威胁模型)。
@@ -218,18 +219,17 @@ ID)。故后端实现上:
 小程序            后端                  EMQX            设备
  │  POST /devices/{id}/wol             │               │
  │──{mac?}──────▶│                     │               │
- │               │ 校验 openid 拥有该设备│               │
+ │◀─{task_id}────│ 校验 openid 拥有该设备│               │
  │               │─REST publish────────▶│               │
  │               │  home/wol/{id}/cmd   │──{cmd:wol}───▶│
  │               │  {cmd:wol,mac}       │               │ 发魔法包
- │               │                     │◀─event(wol)───│
- │               │◀─(MQTT 消费者收到)────│               │
- │◀─SSE 推送结果──│ 关联 request          │               │
- │  或 2~3s 轮询  │                     │               │
+ │ GET .../tasks/{task_id}             │◀─event(wol)───│
+ │──1~2s 轮询───▶│◀─(MQTT 消费者收到)────│               │
+ │◀─任务结果─────│ 关联 task_id          │               │
 ```
 
 后端用 EMQX REST API(`POST /api/v5/publish`)发布指令,用常驻消费者收 event,
-按设备 + 时间窗关联到本次请求,回给小程序。
+按设备 + 时间窗关联到 task,小程序轮询取结果。
 
 ### 6.3 离线推送(App 关闭时)
 
@@ -255,10 +255,17 @@ ID)。故后端实现上:
 | POST | `/auth/wechat-login` | 微信登录,换 openid + 会话 token |
 | POST | `/devices/claim` | 扫码绑定(**覆盖式重绑**):body `{mqtt_id, psk, ...}`;验真后绑给当前用户、轮换 mqtt_pass、返回 BLE 下发所需的 mqtt 配置。失败泛化 + 限流见 5.3 |
 | GET | `/devices` | 当前用户名下设备列表 + 在线状态 |
-| POST | `/devices/{id}/wol` | 唤醒:body `{mac?}`;同步等待或返回 task id |
-| POST | `/devices/{id}/cmd` | 透传其它指令(reboot/info/led/ota…),后端校验归属 |
-| GET | `/devices/{id}/events` | SSE:前台打开时推该设备事件 |
+| POST | `/devices/{id}/wol` | 唤醒:body `{mac?}`;返回 `{task_id}`,结果走轮询 |
+| POST | `/devices/{id}/cmd` | 透传其它指令(reboot/info/led/ota…),后端校验归属;同样返回 `{task_id}` |
+| GET | `/devices/{id}/tasks/{task_id}` | 轮询指令结果:`pending` / `ok` / `error` / `timeout`(+设备回执载荷);任务存内存,终态后保留几分钟即可 |
 | POST | `/devices/{id}/unbind` | 解绑 |
+
+> **为何轮询而非 SSE**:小程序无原生 EventSource;`wx.request` 的 `enableChunked`
+> 可模拟,但需手动拼帧解析、真机/工具行为有差异,为短时突发场景不值得。本产品所有
+> "等结果"场景(wol 回执、net_scan、唤醒测试)都在几秒到一分钟内结束,1~2s 短轮询
+> 体验无差且后端零长连接状态。将来若需常驻实时(如首页在线状态秒级刷新)再升级
+> `wx.connectSocket`(WebSocket),task 接口与数据结构可复用。管理后台为浏览器环境,
+> 不受此限,仍用 SSE。
 
 > **鉴权**:除 `/auth/wechat-login` 外,登录后所有接口均走两层——认证用 `Authorization:
 > Bearer <token>`(登录签发的自包含 HMAC 会话 token,载 openid),授权再按 openid 校
@@ -411,7 +418,7 @@ CREATE TABLE device_status (
 | 控制凭据位置 | 落在客户端 | 仅后端 |
 | 域名/备案 | 额外 wss 合法域名 | 复用 API 域名 |
 | 客户端复杂度 | MQTT.js + 连接生命周期(onShow/onHide) | 普通 HTTPS |
-| 前台实时性 | 最好 | 好(SSE/轮询,WoL 够用) |
+| 前台实时性 | 最好 | 好(短轮询,WoL 够用) |
 
 关键前提:**后端是必选项**(认证 + 推送 + claim),直连"省后端"的卖点不成立;
 小程序不能常驻后台,直连只覆盖前台,价值有限。仅当"前台毫秒级实时是核心卖点"

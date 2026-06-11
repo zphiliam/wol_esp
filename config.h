@@ -22,6 +22,18 @@
 #define STATUS_INTERVAL_MIN      10     // 秒，最短间隔
 #define STATUS_INTERVAL_MAX      3600   // 秒，最长间隔（1 小时）
 
+// ── 局域网发现 net_scan ───────────────────────────────────────────────────────
+#define NETSCAN_ARP_WINDOW      8     // 每窗 ARP 请求数（lwIP ARP 表默认 10 槽，留 2 余量）
+#define NETSCAN_HARVEST_MS      200   // 每窗发送后等待应答收割的时间（ms）
+#define NETSCAN_MAX_HOSTS       64    // 结果上限（静态数组，单条 ~28B，共 <2KB）
+#define NETSCAN_NAME_TIMEOUT_MS 300   // 单台 NBNS / mDNS 名字查询超时（ms）
+#define NETSCAN_BATCH           5     // 每批上报主机数（控制 MQTT 报文 <1KB）
+
+// ── 唤醒验证 wake verify（wol verify:true）─────────────────────────────────────
+#define WAKE_VERIFY_TIMEOUT_MS  (60UL * 1000) // 探测目标上线的总超时
+#define WAKE_VERIFY_PROBE_MS    1000          // 探测节拍：每秒一轮
+#define WAKE_VERIFY_WINDOW      8             // 无 IP 提示时每轮 ARP 请求数（轮转扫 /24）
+
 // ── 测速 ─────────────────────────────────────────────────────────────────────
 #define SPEEDTEST_DEFAULT_URL   "http://mirrors.tuna.tsinghua.edu.cn/speedtest/100mb.bin"
 #define SPEEDTEST_DEFAULT_SECS  15     // 秒，默认测速时长上限

@@ -22,6 +22,7 @@
 | `PROTOCOL.md` | MQTT 主题与报文格式文档 |
 | `docs/BLE_REDESIGN.md` | BLE 配网设计方案与 GATT 协议 |
 | `docs/ARCHITECTURE_v3.md` | 服务端架构：自建 EMQX + 后端中转 + 微信小程序（含权限/claim/时序） |
+| `docs/NET_SCAN.md` | 添加电脑体验：局域网发现（net_scan）+ 唤醒验证（wake verify）设计与跨仓阶段计划 |
 | `test/ble_test.html` | Web Bluetooth 配网测试页（开发用） |
 
 ## 硬件（ESP32-C3 SuperMini）
@@ -184,6 +185,38 @@ setup()
   `ota_success`/`ota_fail`
 - 使用 `HTTPClient` + `Update` 库（均内置），手动逐跳跟踪重定向
 - 固件下载期间 MQTT 断开，进度仅输出串口；成功后设备重启
+
+## 局域网发现（net_scan，阶段 1 已实现）
+
+MQTT 下发 `{"cmd":"net_scan"}` 或串口输入 `netscan`（正常运行模式）触发，扫描设备所在
+/24 网段，把"IP + MAC + 主机名"分批上报，供小程序"点选添加电脑"替代手敲 MAC。
+
+- **非阻塞状态机**（`nsTick()` 每轮 loop 推进）：`IDLE → ARP_SEND（发一窗 8 个
+  `etharp_request`）→ ARP_HARVEST（等 200ms 后 `etharp_find_addr` 收割转存）→ 循环扫完
+  /24 → NAME_QUERY（逐台 NBNS/mDNS，每轮一台）→ REPORT（每批 ≤5 台）→ IDLE`
+- lwIP ARP 表默认 10 槽，故每窗只发 8 个请求；直读 lwIP（`LOCK_TCPIP_CORE` 保护），
+  无需自建 ARP 协议栈
+- **名字查询**：NBNS（UDP 137 NBSTAT 通配 `*`，Windows）→ 无应答再 mDNS 反查
+  （UDP 5353 `<reversed-ip>.in-addr.arpa` PTR，macOS/Linux），均手搓报文、单包问答、超时 300ms
+- 仅扫自身 /24，结果上限 `NETSCAN_MAX_HOSTS`（64）；排除自身与网关；`rand` 标记本地管理
+  位 MAC（随机 MAC 手机）
+- 进行中再收 `net_scan` 回 `error:net_scan_busy`；参数见 `config.h` `NETSCAN_*`
+- 事件 `net_scan_start` / `net_scan_result`（分批，`seq`/`last`）详见 `PROTOCOL.md`
+
+## 唤醒验证（wol verify，阶段 2 已实现）
+
+`{"cmd":"wol","mac":"...","verify":true,"ip":"..."}`：发完魔法包后，独立轻量状态机
+（`wvTick()`）每秒探测目标是否真的上线，复用 net_scan 的 lwIP ARP 直读。
+
+- **按 MAC 判定**（非只信 IP，DHCP 换 IP 也能命中）：每秒先扫 lwIP ARP 表
+  （`etharp_get_entry` 遍历）找目标 MAC → 命中回报 `wake_result(ok:true, ip, elapsed_ms)`；
+  再发探测请求填表（有 `ip` 提示则 ARP 该 IP，并轮转扫 /24 兜底）
+- 超时 `WAKE_VERIFY_TIMEOUT_MS`（默认 60s）回报 `wake_result(ok:false, reason:"timeout")`
+- 与 net_scan 共用 `nsNetif`，互不阻塞各自推进
+
+阶段进度：固件阶段 1/2 完成；后端（esp_auth）net_scan/wake 接口 + OUI 富化、小程序
+discover/verify 页均已实现；阶段 3 的 wol/cmd 迁移 task 模型与 SSE 下线未做（非阻塞）。
+全链路真机联调见 `docs/NET_SCAN.md`。
 
 ## 上报间隔运行时调整
 

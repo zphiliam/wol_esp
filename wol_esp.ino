@@ -23,6 +23,7 @@
  *
  * 指令列表：
  *   {"cmd":"wol"}                              唤醒电脑
+ *   {"cmd":"wol","mac":"...","verify":true,"ip":"..."}  唤醒并验证目标是否上线（回报 wake_result）
  *   {"cmd":"ping"}                             测试连通性
  *   {"cmd":"reboot"}                           重启设备
  *   {"cmd":"info"}                             查询设备运行状态（version/ssid/rssi/wol_mac/reconnects）
@@ -34,6 +35,7 @@
  *   {"cmd":"ota","url":"https://..."}          OTA 升级（自动跟踪重定向，支持 GitHub release URL）
  *   {"cmd":"speedtest"}                         网络测速（HTTP 下载丢弃，默认 15s，MQTT 保持连接）
  *   {"cmd":"speedtest","url":"http://...","max_seconds":10}
+ *   {"cmd":"net_scan"}                          局域网发现（ARP 扫描 + NBNS/mDNS，分批上报）
  */
 
 #include <WiFi.h>
@@ -59,6 +61,11 @@
 
 #include "esp_wifi.h"   // esp_wifi_set_max_tx_power()
 #include "esp_mac.h"    // esp_read_mac()
+
+// ── 局域网发现 net_scan（lwIP ARP 表直读 + NBNS/mDNS 名字查询） ────────────────
+#include "lwip/etharp.h"   // etharp_request() / etharp_find_addr()
+#include "lwip/netif.h"    // netif_list / netif_ip4_addr()
+#include "lwip/tcpip.h"    // LOCK_TCPIP_CORE() / UNLOCK_TCPIP_CORE()
 
 // ── 硬件 ──────────────────────────────────────────────────────────────────────
 const uint8_t LED_PIN = 8;   // ESP32-C3 SuperMini，active LOW
@@ -118,6 +125,22 @@ String        serialLineBuf;           // 串口输入行缓冲
 unsigned long btnPressStart = 0;       // 按键按下时刻
 bool          btnPressing   = false;   // 按键是否持续按住中
 bool          btnHit3s      = false;   // 已达 3s 阈值（松手触发 BLE 配网）
+
+// ── 局域网发现 net_scan 类型（定义在前，供 .ino 自动生成的函数原型可见） ───────
+enum NetScanState {
+    NS_IDLE,
+    NS_ARP_SEND,      // 发一窗 ARP 请求
+    NS_ARP_HARVEST,   // 等待后从 lwIP ARP 表收割
+    NS_NAME_QUERY,    // 逐台查询主机名
+    NS_REPORT,        // 分批发布结果事件
+};
+
+struct ScanHost {
+    uint32_t ip;        // lwIP 网络字节序（与 WiFi.localIP() 的 uint32 表示一致）
+    uint8_t  mac[6];
+    char     name[16];  // 主机名，15 字符 + NUL
+    uint8_t  src;       // 0=无名 1=nbns 2=mdns
+};
 
 // ── LED 非阻塞闪烁状态 ────────────────────────────────────────────────────────
 struct BlinkJob {
@@ -1138,6 +1161,9 @@ void checkRuntimeTriggers() {
                 Serial.println(F("------------------------"));
             } else if (serialLineBuf == "id") {
                 printDeviceId();
+            } else if (serialLineBuf == "netscan") {
+                if (nsStart(false)) Serial.println(F("[NS] scanning... (results to serial)"));
+                else                Serial.println(F("[NS] busy or WiFi not connected"));
             }
             serialLineBuf = "";
         } else {
@@ -1259,6 +1285,449 @@ void sendMagicPacket(const char* mac_str) {
     udp.endPacket();
 
     Serial.printf("[WoL] magic packet → %s (mac: %s)\n", bcast.toString().c_str(), mac_str);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 局域网发现 net_scan（阶段 1）
+//   非阻塞状态机：每轮 loop 推进一步，不阻塞 MQTT keepalive。
+//   IDLE → ARP_SEND（发一窗 ARP 请求）→ ARP_HARVEST（等 ~200ms 收割 lwIP ARP 表）
+//        → [循环直到扫完 /24] → NAME_QUERY（逐台 NBNS/mDNS）→ REPORT（分批上报）→ IDLE
+//   lwIP ARP 表默认 10 槽，故每窗只发 8 个请求，收割后转存自有数组再发下一窗。
+//   只扫自身所在 /24，结果上限 NETSCAN_MAX_HOSTS。详见 docs/NET_SCAN.md。
+//   类型 NetScanState / ScanHost 定义在文件顶部（供 .ino 自动生成的原型可见）。
+// ═════════════════════════════════════════════════════════════════════════════
+static NetScanState  nsState     = NS_IDLE;
+static ScanHost      nsHosts[NETSCAN_MAX_HOSTS];
+static uint8_t       nsHostCount = 0;
+static struct netif* nsNetif     = nullptr;
+static uint32_t      nsSelfIp    = 0;     // 本机 IP（网络字节序）
+static uint32_t      nsGwIp      = 0;     // 网关 IP（网络字节序）
+static uint32_t      nsBase24    = 0;     // /24 网络地址（host 位清零）
+static uint16_t      nsCurHost   = 0;     // 当前扫描到的 host 位（1..254）
+static uint8_t       nsWinCount  = 0;     // 本窗已发请求数
+static uint32_t      nsWinIps[NETSCAN_ARP_WINDOW];
+static unsigned long nsTimer     = 0;
+static uint8_t       nsNameIdx   = 0;     // 名字查询进度
+static uint8_t       nsReportSeq = 0;     // 上报批次序号
+static bool          nsViaMqtt   = false; // true=MQTT 上报，false=串口本地验证
+
+// 定位 WiFi STA 对应的 lwIP netif（按本机 IP 匹配，兜底 netif_default）
+static struct netif* nsFindStaNetif() {
+    for (struct netif* nif = netif_list; nif != nullptr; nif = nif->next)
+        if (netif_ip4_addr(nif)->addr == nsSelfIp) return nif;
+    return netif_default;
+}
+
+// 解析 NBNS NBSTAT 应答，提取首个 workstation(后缀 0x00, 非组) 名字，去尾部空格
+static bool nsParseNbns(const uint8_t* r, int n, char* out, size_t cap) {
+    if (n < 12) return false;
+    int p = 12;                                   // 跳过 DNS 头
+    if ((r[p] & 0xC0) == 0xC0) p += 2;            // 压缩指针
+    else { while (p < n && r[p] != 0) p += r[p] + 1; p += 1; }   // 逐 label 至 0
+    p += 2 + 2 + 4;                               // type(2) class(2) ttl(4)
+    if (p + 2 > n) return false;
+    p += 2;                                        // rdlength(2)
+    if (p >= n) return false;
+    int numNames = r[p++];
+    for (int i = 0; i < numNames && p + 18 <= n; i++) {
+        const uint8_t* name = r + p;
+        uint8_t  suffix = r[p + 15];
+        uint16_t flags  = ((uint16_t)r[p + 16] << 8) | r[p + 17];
+        bool     group  = flags & 0x8000;
+        if (suffix == 0x00 && !group) {
+            int end = 15;
+            while (end > 0 && (name[end - 1] == ' ' || name[end - 1] == 0)) end--;
+            int copy = (end < (int)cap - 1) ? end : (int)cap - 1;
+            memcpy(out, name, copy);
+            out[copy] = '\0';
+            return out[0] != '\0';
+        }
+        p += 18;
+    }
+    return false;
+}
+
+// 解码 DNS 名字的首个 label（处理压缩指针），用于 mDNS PTR 应答取主机名
+static bool nsDecodeFirstLabel(const uint8_t* r, int n, int p, char* out, size_t cap) {
+    int outpos = 0, safety = 0;
+    while (p >= 0 && p < n && safety++ < 32) {
+        uint8_t len = r[p];
+        if (len == 0) break;
+        if ((len & 0xC0) == 0xC0) {                // 压缩指针 → 跳转
+            if (p + 1 >= n) break;
+            p = ((len & 0x3F) << 8) | r[p + 1];
+            continue;
+        }
+        p++;
+        for (int i = 0; i < len && p < n; i++, p++)
+            if (outpos < (int)cap - 1) out[outpos++] = r[p];
+        break;                                     // 只取首 label（主机名，跳过 .local）
+    }
+    out[outpos] = '\0';
+    return outpos > 0;
+}
+
+// 跳过一个 DNS 名字字段，返回其后偏移
+static int nsSkipName(const uint8_t* r, int n, int p) {
+    while (p < n) {
+        uint8_t len = r[p];
+        if (len == 0)              return p + 1;
+        if ((len & 0xC0) == 0xC0)  return p + 2;
+        p += len + 1;
+    }
+    return p;
+}
+
+// 解析 mDNS 反查 PTR 应答，取主机名首 label
+static bool nsParseMdns(const uint8_t* r, int n, char* out, size_t cap) {
+    if (n < 12) return false;
+    int qd = ((int)r[4] << 8) | r[5];
+    int an = ((int)r[6] << 8) | r[7];
+    if (an < 1) return false;
+    int p = 12;
+    for (int i = 0; i < qd; i++) { p = nsSkipName(r, n, p); p += 4; }  // 跳问题区
+    p = nsSkipName(r, n, p);                       // 应答 name
+    if (p + 10 > n) return false;
+    int type = ((int)r[p] << 8) | r[p + 1]; p += 2;
+    p += 2 + 4;                                    // class(2) ttl(4)
+    int rdlen = ((int)r[p] << 8) | r[p + 1]; p += 2;
+    if (type != 0x0C || p + rdlen > n) return false;   // 0x0C = PTR
+    return nsDecodeFirstLabel(r, n, p, out, cap);
+}
+
+// 向目标 UDP 137 发 NBSTAT 通配查询（*），解析应答主机名（单包问答，超时 300ms）
+static void nsNbnsQuery(ScanHost& h) {
+    WiFiUDP u;
+    if (!u.begin(0)) return;                       // 临时本地端口收应答
+    uint8_t q[50];
+    int p = 0;
+    uint16_t txid = (uint16_t)(millis() & 0xFFFF);
+    q[p++] = txid >> 8; q[p++] = txid & 0xFF;      // ID
+    q[p++] = 0x00; q[p++] = 0x00;                  // flags
+    q[p++] = 0x00; q[p++] = 0x01;                  // QDCOUNT=1
+    q[p++] = 0x00; q[p++] = 0x00;                  // ANCOUNT
+    q[p++] = 0x00; q[p++] = 0x00;                  // NSCOUNT
+    q[p++] = 0x00; q[p++] = 0x00;                  // ARCOUNT
+    q[p++] = 0x20;                                  // name 长度 32
+    q[p++] = 'C'; q[p++] = 'K';                    // '*' 的 NetBIOS 一级编码
+    for (int i = 0; i < 30; i++) q[p++] = 'A';     // 15 个 NUL 的编码
+    q[p++] = 0x00;                                  // name 结束
+    q[p++] = 0x00; q[p++] = 0x21;                  // type NBSTAT
+    q[p++] = 0x00; q[p++] = 0x01;                  // class IN
+
+    u.beginPacket(IPAddress(h.ip), 137);
+    u.write(q, p);
+    u.endPacket();
+
+    unsigned long t = millis();
+    while (millis() - t < NETSCAN_NAME_TIMEOUT_MS) {
+        if (u.parsePacket() > 0) {
+            uint8_t resp[256];
+            int n = u.read(resp, sizeof(resp));
+            if (n > 0 && nsParseNbns(resp, n, h.name, sizeof(h.name))) h.src = 1;
+            break;
+        }
+        delay(10);
+    }
+    u.stop();
+}
+
+// 向目标 UDP 5353 发 <reversed-ip>.in-addr.arpa PTR 单播查询，解析主机名
+static void nsMdnsQuery(ScanHost& h) {
+    WiFiUDP u;
+    if (!u.begin(0)) return;
+    uint8_t q[64];
+    int p = 0;
+    q[p++] = 0x00; q[p++] = 0x00;                  // ID（mDNS 用 0）
+    q[p++] = 0x00; q[p++] = 0x00;                  // flags
+    q[p++] = 0x00; q[p++] = 0x01;                  // QDCOUNT=1
+    q[p++] = 0x00; q[p++] = 0x00;
+    q[p++] = 0x00; q[p++] = 0x00;
+    q[p++] = 0x00; q[p++] = 0x00;
+    // h.ip 为网络字节序：byte0=a..byte3=d；PTR 需逆序 d.c.b.a
+    for (int i = 3; i >= 0; i--) {
+        uint8_t v = (h.ip >> (i * 8)) & 0xFF;
+        char num[4];
+        int l = snprintf(num, sizeof(num), "%u", v);
+        q[p++] = (uint8_t)l;
+        memcpy(q + p, num, l); p += l;
+    }
+    static const char* suf[2] = { "in-addr", "arpa" };
+    for (int s = 0; s < 2; s++) {
+        int l = strlen(suf[s]);
+        q[p++] = (uint8_t)l;
+        memcpy(q + p, suf[s], l); p += l;
+    }
+    q[p++] = 0x00;                                  // root
+    q[p++] = 0x00; q[p++] = 0x0C;                  // type PTR
+    q[p++] = 0x00; q[p++] = 0x01;                  // class IN
+
+    u.beginPacket(IPAddress(h.ip), 5353);
+    u.write(q, p);
+    u.endPacket();
+
+    unsigned long t = millis();
+    while (millis() - t < NETSCAN_NAME_TIMEOUT_MS) {
+        if (u.parsePacket() > 0) {
+            uint8_t resp[300];
+            int n = u.read(resp, sizeof(resp));
+            if (n > 0 && nsParseMdns(resp, n, h.name, sizeof(h.name))) h.src = 2;
+            break;
+        }
+        delay(10);
+    }
+    u.stop();
+}
+
+// 启动一次扫描（busy 时返回 false）。viaMqtt=true 经 MQTT 上报，false 仅串口。
+static bool nsStart(bool viaMqtt) {
+    if (nsState != NS_IDLE) return false;
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    nsSelfIp  = (uint32_t)WiFi.localIP();
+    nsGwIp    = (uint32_t)WiFi.gatewayIP();
+    nsBase24  = nsSelfIp & 0x00FFFFFF;             // 清零 host 位（第 4 octet）
+    nsNetif   = nsFindStaNetif();
+    nsHostCount = 0;
+    nsCurHost   = 1;
+    nsNameIdx   = 0;
+    nsReportSeq = 0;
+    nsViaMqtt   = viaMqtt;
+    nsState     = NS_ARP_SEND;
+
+    char subnet[20];
+    snprintf(subnet, sizeof(subnet), "%u.%u.%u.0/24",
+             (unsigned)(nsBase24 & 0xFF), (unsigned)((nsBase24 >> 8) & 0xFF),
+             (unsigned)((nsBase24 >> 16) & 0xFF));
+    Serial.printf("[NS] scan start: %s (self=%s gw=%s)\n", subnet,
+                  IPAddress(nsSelfIp).toString().c_str(),
+                  IPAddress(nsGwIp).toString().c_str());
+
+    if (nsViaMqtt) {
+        StaticJsonDocument<160> doc;
+        doc["event"]  = "net_scan_start";
+        doc["subnet"] = subnet;
+        doc["hosts"]  = 254;
+        pubJson(doc);
+    }
+    return true;
+}
+
+// 发布（或串口打印）一批结果
+static void nsReportBatch() {
+    uint8_t start = nsReportSeq * NETSCAN_BATCH;
+    uint8_t end   = start + NETSCAN_BATCH;
+    if (end > nsHostCount) end = nsHostCount;
+    bool last = (end >= nsHostCount);
+
+    StaticJsonDocument<1024> doc;
+    doc["event"] = "net_scan_result";
+    doc["seq"]   = nsReportSeq;
+    doc["last"]  = last;
+    JsonArray arr = doc.createNestedArray("hosts");
+    for (uint8_t i = start; i < end; i++) {
+        ScanHost& h = nsHosts[i];
+        JsonObject o = arr.createNestedObject();
+        char ipStr[16];
+        snprintf(ipStr, sizeof(ipStr), "%u.%u.%u.%u",
+                 (unsigned)(h.ip & 0xFF), (unsigned)((h.ip >> 8) & 0xFF),
+                 (unsigned)((h.ip >> 16) & 0xFF), (unsigned)((h.ip >> 24) & 0xFF));
+        o["ip"] = ipStr;
+        char macStr[13];
+        snprintf(macStr, sizeof(macStr), "%02X%02X%02X%02X%02X%02X",
+                 h.mac[0], h.mac[1], h.mac[2], h.mac[3], h.mac[4], h.mac[5]);
+        o["mac"] = macStr;
+        if (h.name[0]) {
+            o["name"] = h.name;
+            o["src"]  = (h.src == 1) ? "nbns" : "mdns";
+        }
+        if (h.mac[0] & 0x02) o["rand"] = true;     // 本地管理位 → 大概率随机 MAC
+    }
+
+    if (nsViaMqtt) {
+        pubJson(doc);
+    } else {
+        char buf[768];
+        serializeJson(doc, buf, sizeof(buf));
+        Serial.printf("[NS] %s\n", buf);
+    }
+    nsReportSeq++;
+    if (last) {
+        nsState = NS_IDLE;
+        Serial.printf("[NS] done: %u host(s)\n", nsHostCount);
+    }
+}
+
+// net_scan 状态机推进：每轮 loop 调用一次，非阻塞（名字查询每轮处理一台）
+static void nsTick() {
+    switch (nsState) {
+    case NS_IDLE:
+        return;
+
+    case NS_ARP_SEND: {
+        nsWinCount = 0;
+        LOCK_TCPIP_CORE();
+        while (nsCurHost <= 254 && nsWinCount < NETSCAN_ARP_WINDOW) {
+            uint32_t ip = nsBase24 | ((uint32_t)nsCurHost << 24);
+            nsCurHost++;
+            if (ip == nsSelfIp || ip == nsGwIp) continue;   // 排除自身、网关
+            ip4_addr_t a; a.addr = ip;
+            etharp_request(nsNetif, &a);
+            nsWinIps[nsWinCount++] = ip;
+        }
+        UNLOCK_TCPIP_CORE();
+        nsTimer = millis();
+        nsState = NS_ARP_HARVEST;
+        break;
+    }
+
+    case NS_ARP_HARVEST: {
+        if (millis() - nsTimer < NETSCAN_HARVEST_MS) return;
+        LOCK_TCPIP_CORE();
+        for (uint8_t i = 0; i < nsWinCount && nsHostCount < NETSCAN_MAX_HOSTS; i++) {
+            ip4_addr_t a; a.addr = nsWinIps[i];
+            struct eth_addr*  eth = nullptr;
+            const ip4_addr_t* ipr = nullptr;
+            if (etharp_find_addr(nsNetif, &a, &eth, &ipr) >= 0 && eth) {
+                ScanHost& h = nsHosts[nsHostCount++];
+                h.ip = nsWinIps[i];
+                memcpy(h.mac, eth->addr, 6);
+                h.name[0] = '\0';
+                h.src = 0;
+            }
+        }
+        UNLOCK_TCPIP_CORE();
+        if (nsCurHost <= 254 && nsHostCount < NETSCAN_MAX_HOSTS) {
+            nsState = NS_ARP_SEND;                  // 继续下一窗
+        } else {
+            Serial.printf("[NS] ARP sweep done: %u host(s), resolving names...\n", nsHostCount);
+            nsNameIdx = 0;
+            nsState   = NS_NAME_QUERY;
+        }
+        break;
+    }
+
+    case NS_NAME_QUERY: {
+        if (nsNameIdx >= nsHostCount) {
+            nsReportSeq = 0;
+            nsState     = NS_REPORT;
+            return;
+        }
+        ScanHost& h = nsHosts[nsNameIdx];
+        nsNbnsQuery(h);                             // 先 NBNS（Windows）
+        if (h.name[0] == '\0') nsMdnsQuery(h);     // 无名再 mDNS 反查（mac/linux）
+        nsNameIdx++;
+        break;
+    }
+
+    case NS_REPORT:
+        nsReportBatch();
+        break;
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 唤醒验证 wake verify（wol verify:true，阶段 2）
+//   发完魔法包后，独立轻量状态机每秒探测目标是否真的上线：复用 net_scan 的 lwIP
+//   ARP 直读。按 MAC（而非只信 IP）判定——DHCP 可能换 IP，MAC 才是稳定标识：
+//     - 每秒先扫 lwIP ARP 表找目标 MAC（命中即上线，回报其当前 IP）
+//     - 再发探测请求填表供下一秒收割：有 ip 提示则 ARP 该 IP；并轮转扫 /24 兜底
+//   超时 WAKE_VERIFY_TIMEOUT_MS 回报 ok:false reason:timeout。详见 docs/NET_SCAN.md。
+// ═════════════════════════════════════════════════════════════════════════════
+#ifndef ARP_TABLE_SIZE
+#define ARP_TABLE_SIZE 10
+#endif
+
+static bool          wvActive   = false;
+static uint8_t       wvTargetMac[6];
+static char          wvMacStr[13];
+static uint32_t      wvHintIp   = 0;   // 网络字节序，0=无提示
+static uint16_t      wvSweepHost = 1;  // 无提示时 /24 轮转游标
+static unsigned long wvStart    = 0;
+static unsigned long wvLastProbe = 0;
+
+// 回报唤醒验证结果并结束探测
+static void wvFinish(bool ok, uint32_t foundIp, const char* reason) {
+    StaticJsonDocument<160> doc;
+    doc["event"] = "wake_result";
+    doc["ok"]    = ok;
+    doc["mac"]   = wvMacStr;
+    if (ok) {
+        doc["ip"]         = IPAddress(foundIp).toString();
+        doc["elapsed_ms"] = (unsigned long)(millis() - wvStart);
+    } else if (reason) {
+        doc["reason"] = reason;
+    }
+    pubJson(doc);
+    Serial.printf("[WV] result ok=%d mac=%s\n", ok, wvMacStr);
+    wvActive = false;
+}
+
+// 启动唤醒验证。mac 为 12 位 hex（已校验）；ipHint 可空。
+static void wvStartVerify(const char* mac, const char* ipHint) {
+    strlcpy(wvMacStr, mac, sizeof(wvMacStr));
+    for (int i = 0; i < 6; i++) {
+        char h[3] = { mac[i * 2], mac[i * 2 + 1], '\0' };
+        wvTargetMac[i] = (uint8_t)strtol(h, nullptr, 16);
+    }
+    wvHintIp = 0;
+    if (ipHint && ipHint[0]) {
+        IPAddress tmp;
+        if (tmp.fromString(ipHint)) wvHintIp = (uint32_t)tmp;
+    }
+    nsSelfIp = (uint32_t)WiFi.localIP();
+    nsBase24 = nsSelfIp & 0x00FFFFFF;
+    nsNetif  = nsFindStaNetif();
+    wvSweepHost = 1;
+    wvStart     = millis();
+    wvLastProbe = 0;   // 立即第一轮（先发探测，下一拍收割）
+    wvActive    = true;
+    Serial.printf("[WV] verify start mac=%s hint=%s\n", wvMacStr,
+                  wvHintIp ? IPAddress(wvHintIp).toString().c_str() : "(none)");
+}
+
+// 每轮 loop 调用，非阻塞，每秒推进一拍
+static void wvTick() {
+    if (!wvActive) return;
+    unsigned long now = millis();
+    if (now - wvStart > WAKE_VERIFY_TIMEOUT_MS) {
+        wvFinish(false, 0, "timeout");
+        return;
+    }
+    if (now - wvLastProbe < WAKE_VERIFY_PROBE_MS) return;
+    wvLastProbe = now;
+
+    // 1. 收割：扫 lwIP ARP 表，按 MAC 找目标
+    uint32_t foundIp = 0;
+    LOCK_TCPIP_CORE();
+    for (size_t i = 0; i < ARP_TABLE_SIZE; i++) {
+        ip4_addr_t*      ip  = nullptr;
+        struct netif*    nif = nullptr;
+        struct eth_addr* eth = nullptr;
+        if (etharp_get_entry(i, &ip, &nif, &eth) && eth && ip) {
+            if (memcmp(eth->addr, wvTargetMac, 6) == 0) { foundIp = ip->addr; break; }
+        }
+    }
+    UNLOCK_TCPIP_CORE();
+    if (foundIp != 0) {
+        wvFinish(true, foundIp, nullptr);
+        return;
+    }
+
+    // 2. 发探测请求填表（供下一拍收割）
+    LOCK_TCPIP_CORE();
+    if (wvHintIp != 0) {
+        ip4_addr_t a; a.addr = wvHintIp;
+        etharp_request(nsNetif, &a);
+    }
+    for (uint8_t k = 0; k < WAKE_VERIFY_WINDOW; k++) {
+        uint32_t ip = nsBase24 | ((uint32_t)wvSweepHost << 24);
+        wvSweepHost = (wvSweepHost >= 254) ? 1 : wvSweepHost + 1;
+        if (ip == nsSelfIp) continue;
+        ip4_addr_t a; a.addr = ip;
+        etharp_request(nsNetif, &a);
+    }
+    UNLOCK_TCPIP_CORE();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1674,6 +2143,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
         resp["event"] = "wol";
         resp["mac"]   = target_mac;
         pubJson(resp);
+        // verify:true → 发包后进入唤醒验证探测（异步，回报 wake_result）
+        if (doc["verify"] | false) {
+            wvStartVerify(target_mac, doc["ip"] | "");
+        }
 
     // ── ping ──
     } else if (strcmp(cmd, "ping") == 0) {
@@ -1797,6 +2270,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
         const char* url = doc["url"] | SPEEDTEST_DEFAULT_URL;
         int maxSec      = doc["max_seconds"] | SPEEDTEST_DEFAULT_SECS;
         doSpeedtest(url, maxSec);
+
+    // ── net_scan ──
+    } else if (strcmp(cmd, "net_scan") == 0) {
+        // 扫描进行中（或 OTA 等占用）再收指令 → busy；结果经 nsTick 异步分批上报
+        if (!nsStart(true)) pubEvent("error:net_scan_busy");
 
     // ── 未知指令 ──
     } else {
@@ -2118,6 +2596,12 @@ void loop() {
     // ── 6. 运行时触发检测（串口 config 命令 / 按键重置）──
     checkRuntimeTriggers();
 
-    // ── 7. LED 非阻塞闪烁驱动 ──
+    // ── 7. net_scan 状态机推进（非阻塞，空闲时立即返回）──
+    nsTick();
+
+    // ── 8. 唤醒验证探测推进（非阻塞，空闲时立即返回）──
+    wvTick();
+
+    // ── 9. LED 非阻塞闪烁驱动 ──
     blinkTick();
 }

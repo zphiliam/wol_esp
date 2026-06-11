@@ -41,6 +41,14 @@
 
 ---
 
+### 添加电脑体验：局域网发现 net_scan（阶段 1，固件）
+
+- MQTT `{"cmd":"net_scan"}` / 串口 `netscan`：ARP 扫 /24 + NBNS/mDNS 解析主机名，分批上报
+- 非阻塞状态机，直读 lwIP ARP 表；事件 `net_scan_start` / `net_scan_result`
+- 阶段 2（wol `verify` 唤醒验证）及后端/小程序阶段见 `docs/NET_SCAN.md`
+
+---
+
 ## ⏳ 进行中 / 待启动
 
 ### 阶段 3：微信小程序配网（待启动）

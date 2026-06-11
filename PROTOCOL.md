@@ -30,6 +30,16 @@
 > - `mac` 格式：12 位十六进制字符，无分隔符，大小写均可
 > - 若指令未带 `mac` 且设备未存默认 MAC（`wol_mac` 为空），返回 `error:no_mac` 事件，不发包
 
+**唤醒验证**：发包后探测目标是否真的上线（用于"测试唤醒"）：
+```json
+{"cmd":"wol","mac":"AABBCCDDEEFF","verify":true,"ip":"192.168.1.5"}
+```
+
+> - `verify` 可选，缺省 `false` 时行为与上文一致（仅发包 + `wol` 事件，向后兼容）
+> - `ip` 可选提示（上次已知 IP，加速探测）；设备最终按 **MAC** 判定上线（DHCP 换 IP 也能命中）
+> - 流程：立即发魔法包 + `wol` 事件 → 每秒探测局域网 ARP 表找该 MAC → 命中回报 `wake_result(ok:true)`；
+>   超时（`WAKE_VERIFY_TIMEOUT_MS`，默认 60s）回报 `wake_result(ok:false, reason:"timeout")`
+
 ### 测试连通性
 ```json
 {"cmd":"ping"}
@@ -128,6 +138,18 @@
 - 计时从收到首字节开始，不含 TCP 握手和 HTTP 头部解析耗时
 - 执行前检查 heap 连续可用块，不足 6144 字节时拒绝并返回 `error:heap_low`
 
+### 局域网发现（net_scan）
+
+```json
+{"cmd":"net_scan"}
+```
+
+- 扫描设备所在 /24 网段，发现在线主机（IP + MAC），并尝试解析主机名（NBNS / mDNS 反查）
+- 结果经 `net_scan_start` + 多个 `net_scan_result` 事件**分批异步上报**（见下）
+- 扫描全程非阻塞，约 10～15s 完成；进行中再收到 `net_scan` 返回 `error:net_scan_busy`
+- 仅扫自身 /24，结果上限 64 台；已排除设备自身与网关
+- 串口命令 `netscan`（正常运行模式）可单机触发，结果打印到串口，便于不依赖后端验证
+
 ---
 
 ## 上行事件
@@ -202,6 +224,17 @@
 ```
 
 > `mac`：实际发送魔法包的目标 MAC 地址（来自命令参数或设备配置）
+
+### 唤醒验证结果（wake_result）
+
+`wol` 指令带 `verify:true` 时，探测结束后发出：
+```json
+{"event":"wake_result","ok":true,"mac":"AABBCCDDEEFF","ip":"192.168.1.5","elapsed_ms":23400,"uptime":120,"heap":44000,"ip":"..."}
+{"event":"wake_result","ok":false,"mac":"AABBCCDDEEFF","reason":"timeout","uptime":180,"heap":44000}
+```
+
+> - `ok:true` 时带探测到的 `ip` 与 `elapsed_ms`（从发包到确认上线的耗时）
+> - `ok:false` 时 `reason` 取值目前为 `timeout`（60s 内未探测到该 MAC 上线）
 
 ### Ping 响应
 ```json
@@ -302,6 +335,41 @@
 }
 ```
 
+### 局域网发现事件（net_scan）
+
+扫描开始（发现前发出一次）：
+```json
+{
+  "event": "net_scan_start",
+  "subnet": "192.168.1.0/24",
+  "hosts": 254,
+  "uptime": 3600,
+  "heap": 44000,
+  "ip": "192.168.1.100"
+}
+```
+
+扫描结果（分批，每批 ≤5 台）：
+```json
+{
+  "event": "net_scan_result",
+  "seq": 0,
+  "last": false,
+  "hosts": [
+    {"ip":"192.168.1.5","mac":"AABBCCDDEEFF","name":"DESKTOP-A7K2","src":"nbns"},
+    {"ip":"192.168.1.13","mac":"DE12AB34CD56","rand":true}
+  ],
+  "uptime": 3608,
+  "heap": 43000,
+  "ip": "192.168.1.100"
+}
+```
+
+> - `seq`：批次序号，从 0 递增
+> - `last`：是否为末批；零结果时也会发一批空 `hosts` + `last:true`
+> - `name` / `src`：解析到主机名时携带，`src` 取值 `nbns`（Windows）/ `mdns`（macOS/Linux）；无名时两字段省略
+> - `rand`：MAC 为本地管理地址（首字节 bit1 置位）时为 `true`，大概率是开启随机 MAC 的手机/设备
+
 ### OTA 事件
 
 升级开始（MQTT 断开前发出）：
@@ -381,3 +449,4 @@
 | `error:heap_low` | speedtest 执行时 heap 连续可用块不足 6144 字节 |
 | `error:set_mqtt_no_change` | set_mqtt 指令所有字段均与当前配置相同 |
 | `error:mqtt_connect_failed` | set_mqtt 指令测试连接失败，原配置保留（附 `rc` 字段）|
+| `error:net_scan_busy` | net_scan 指令在上一次扫描仍进行时收到 |
