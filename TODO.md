@@ -49,17 +49,23 @@
 
 ---
 
-## ⏳ 进行中 / 待启动
+### 阶段 3：微信小程序（独立仓库 `../wolapp`）
 
-### 阶段 3：微信小程序配网（待启动）
-
-- 纯客户端工作，照搬 `test/ble_test.html` 逻辑
-- 加密库需打包纯 JS（`@noble/curves` + `@noble/ciphers`），BLE 须真机调试
-- 工程位置（`miniprogram/` 子目录 vs 独立仓库）待定
+- BLE 加密配网（含 MQTT 凭据下发）、扫描发现 + 测试唤醒添加电脑均已实现
 - 详见 `docs/BLE_REDESIGN.md` §9
 
-### v3 服务端（设计定稿，待实现）
+### v3 服务端（独立仓库 `../esp_auth`，已部署）
 
-- 自建 EMQX + 后端中转 + claim 覆盖式重绑，含 SQLite DDL
-- 尚无实现代码；建议先落后端骨架（认证端点 + claim + 设备登记导入）
+- Go + SQLite：EMQX HTTP 认证钩子、claim 覆盖式重绑、指令中转与设备状态
+- net_scan / 唤醒验证后端（task 轮询 + OUI 富化 + last_ip）
 - 详见 `docs/ARCHITECTURE_v3.md`
+
+---
+
+## ⏳ 进行中 / 待启动
+
+### net_scan 阶段 3 收尾（非阻塞）
+
+- 存量 wol/cmd 接口迁移 task 模型 + SSE 下线（后端）
+- 全链路真机联调
+- 详见 `docs/NET_SCAN.md`
